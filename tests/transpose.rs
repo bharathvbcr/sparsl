@@ -82,10 +82,10 @@ fn transpose_matches_a_dense_reference() {
     // Dense A^T, built straight from the CSR: column `c` of A^T gathers every
     // stored entry whose CSR column is `c`.
     let mut want = vec![0.0f32; ncols];
-    for r in 0..nrows {
+    for (r, xr) in x.iter().enumerate() {
         let (s, e) = (csr.row_ptr[r] as usize, csr.row_ptr[r + 1] as usize);
         for i in s..e {
-            want[csr.col[i] as usize] += weights[i] * x[r];
+            want[csr.col[i] as usize] += weights[i] * xr;
         }
     }
 
