@@ -60,21 +60,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------------
-  # Metal: compiled and linted, deliberately NOT tested.
+  # Metal, tested for real on a hosted runner.
   #
-  # GitHub-hosted macOS runners do not expose a Metal device. `cargo test
-  # --features metal` would therefore fail here — and it would fail *correctly*,
-  # because `differential.rs::the_suite_actually_has_something_to_test` asserts
-  # that a build carrying the `metal` feature on macOS must find Metal
-  # available. That assertion exists so a suite cannot silently pass while
-  # testing nothing, and it is doing its job. Do not "fix" a red run by
-  # deleting that test or by dropping the feature flag from it.
+  # This job was originally written to build only, on the documented basis that
+  # GitHub-hosted macOS runners expose no Metal device. That is out of date: on
+  # `macos-26` arm64, `Device::try_new(Backend::Metal)` succeeds — it finds a
+  # device, compiles the MSL library and builds all three pipeline states. The
+  # workflow's own probe step is what caught it, by printing "ran on Metal GPU"
+  # where the build-only assumption predicted a fallback to CPU.
   #
-  # So this job typechecks and lints the Metal backend, and the GPU job below
-  # actually runs it.
+  # So the suite runs here. If a future runner image drops the device, this job
+  # fails loudly rather than quietly skipping, because
+  # `the_suite_actually_has_something_to_test` asserts that a macOS build
+  # carrying the metal feature must find Metal available. That is the correct
+  # failure: it means the GPU arm stopped being tested.
   # ---------------------------------------------------------------------------
-  metal-build:
-    name: metal / typecheck only (no GPU on hosted runners)
+  metal:
+    name: metal / full suite
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -82,39 +84,35 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --features metal --all-targets -- -D warnings
-      - run: cargo build --features metal --all-targets --release
-      - name: Report whether this runner has a Metal device
-        # Must carry `--features metal`, or this probes the cargo feature rather
-        # than the hardware and reports "built without the metal feature" no
-        # matter what the runner has — which is what the first run of this
-        # workflow did.
-        #
-        # Informational only. If it ever starts reporting "ran on Metal GPU",
-        # hosted runners gained a Metal device and the `metal-gpu` job below can
-        # come off self-hosted.
-        continue-on-error: true
+      - name: Report which device this runner has
         run: cargo run --release --features metal --example readme
+      - run: cargo clippy --features metal --all-targets -- -D warnings
+      - name: Full suite with Metal
+        run: cargo test --features metal --release --all-targets
 
   # ---------------------------------------------------------------------------
-  # The real GPU arm. Requires a self-hosted Apple silicon runner.
+  # Bare-metal Apple silicon, for measurement rather than coverage.
+  #
+  # Correctness is covered by the hosted `metal` job above. What a hosted runner
+  # cannot give is a trustworthy *number*: it is virtualised and shared, so
+  # crossover timings from it would describe the runner, not the hardware anyone
+  # runs this on.
   #
   # Gated on a repository variable rather than merely targeting `self-hosted`,
-  # because a job whose runner label matches nothing queues indefinitely instead
-  # of skipping. Set `HAS_METAL_RUNNER` to `true` in
+  # because a job whose runner labels match nothing queues indefinitely instead
+  # of skipping. Set `HAS_METAL_RUNNER` to `true` under
   # Settings → Secrets and variables → Actions → Variables once a runner is
-  # registered with the labels below.
+  # registered.
   # ---------------------------------------------------------------------------
-  metal-gpu:
-    name: metal / full suite on a real GPU
+  metal-bench:
+    name: metal / crossover measurement on bare metal
     if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Full suite with Metal
-        run: cargo test --features metal --release --all-targets
+      - run: cargo test --features metal --release --all-targets
       - name: Crossover measurement
         # Not a gate — the numbers land in the job log so a regression in the
         # CPU/GPU crossover is visible without anyone running it by hand.
