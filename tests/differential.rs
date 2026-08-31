@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use proptest::prelude::*;
-use sparsl::{tolerance_for_elementwise, tolerance_for_nnz_per_row, Backend, Device, Rng};
+use sparsl::{tolerance_for_elementwise, tolerance_for_spmv, Backend, Device, Rng};
 
 /// A suite that silently tests nothing must not look like a suite that passed.
 ///
@@ -50,12 +50,19 @@ fn spmv_matches_reference_across_shapes() {
             let op_ref = reference.prepare(&csr, ncols, &weights).expect("valid");
             let op = device.prepare(&csr, ncols, &weights).expect("valid");
             let shape = op.shape();
-            let tol = tolerance_for_nnz_per_row(shape.nnz_per_row(), max_abs_term(&weights, &x));
-
             let mut y_ref = y0.clone();
             let mut y_got = y0;
             op_ref.spmv(&x, &mut y_ref).expect("ref spmv");
             op.spmv(&x, &mut y_got).expect("spmv");
+
+            // Sized after the fact, from the reference result: the bound
+            // depends on the magnitude `y` actually reached, which is not
+            // knowable from the inputs alone.
+            let tol = tolerance_for_spmv(
+                shape.max_row_nnz,
+                max_abs_term(&weights, &x),
+                max_abs(&y_ref),
+            );
 
             assert_close(
                 &y_got,
@@ -84,15 +91,19 @@ fn spmv_accumulates_rather_than_overwrites() {
 
         let op_ref = reference.prepare(&csr, ncols, &weights).expect("valid");
         let op = device.prepare(&csr, ncols, &weights).expect("valid");
-        let tol =
-            tolerance_for_nnz_per_row(op.shape().nnz_per_row() * 2, max_abs_term(&weights, &x));
-
         let mut y_ref = y0.clone();
         let mut y_got = y0;
         for _ in 0..3 {
             op_ref.spmv(&x, &mut y_ref).expect("ref");
             op.spmv(&x, &mut y_got).expect("got");
         }
+        // Three accumulations feed one result, so the row work triples and the
+        // magnitude to bound is the one `y` actually reached.
+        let tol = tolerance_for_spmv(
+            op.shape().max_row_nnz * 3,
+            max_abs_term(&weights, &x),
+            max_abs(&y_ref),
+        );
         assert_close(
             &y_got,
             &y_ref,
@@ -128,7 +139,13 @@ fn fused_spmv_lif_matches_reference_across_shapes() {
             let op_ref = reference.prepare(&csr, ncols, &weights).expect("valid");
             let op = device.prepare(&csr, ncols, &weights).expect("valid");
             let shape = op.shape();
-            let tol = tolerance_for_nnz_per_row(shape.nnz_per_row(), max_abs_term(&weights, &x));
+            let tol = tolerance_for_spmv(
+                shape.max_row_nnz,
+                max_abs_term(&weights, &x),
+                v0.iter()
+                    .chain(theta0.iter())
+                    .fold(0.0f32, |m, t| m.max(t.abs())),
+            );
 
             // Reference synaptic current, needed to judge whether a spike flip
             // sits inside the boundary band.
@@ -281,12 +298,13 @@ proptest! {
         for backend in backends_under_test() {
             let device = Device::try_new(backend).expect("available");
             let op = device.prepare(&csr, ncols, &weights).expect("valid");
-            let tol = tolerance_for_nnz_per_row(
-                op.shape().nnz_per_row(),
-                max_abs_term(&weights, &x),
-            );
             let mut y_got = y0.clone();
             op.spmv(&x, &mut y_got).expect("got");
+            let tol = tolerance_for_spmv(
+                op.shape().max_row_nnz,
+                max_abs_term(&weights, &x),
+                max_abs(&y_ref),
+            );
             for (i, (g, r)) in y_got.iter().zip(y_ref.iter()).enumerate() {
                 prop_assert!(
                     (g - r).abs() <= tol,

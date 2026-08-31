@@ -351,11 +351,22 @@ pub struct SparseShape {
     pub nrows: usize,
     pub ncols: usize,
     pub nnz: usize,
+    /// Stored non-zeros in the longest row.
+    ///
+    /// Separate from the mean because error bounds depend on the longest row,
+    /// not the average one. See [`SparseShape::nnz_per_row`].
+    pub max_row_nnz: usize,
 }
 
 impl SparseShape {
-    /// Mean stored non-zeros per row, rounded up. Feeds
-    /// [`tolerance_for_nnz_per_row`].
+    /// Mean stored non-zeros per row, rounded up.
+    ///
+    /// **Do not size an error tolerance with this.** A ragged operator — most
+    /// rows empty, a few long — has a mean that describes none of its rows, and
+    /// a bound derived from it is too tight for exactly the rows that need it
+    /// most. Use [`SparseShape::max_row_nnz`]. A 50,000-case fuzz found this
+    /// the hard way on a 380-row operator whose mean degree rounded to 1 while
+    /// its populated rows held two entries.
     pub fn nnz_per_row(self) -> usize {
         if self.nrows == 0 {
             0
@@ -365,20 +376,6 @@ impl SparseShape {
     }
 }
 
-/// Upper bound on the CPU/GPU disagreement for one SpMV row.
-///
-/// This is the textbook forward error bound for recursive summation —
-/// `n · eps · max|term|` — with a factor of 8 of headroom, **not** a curve
-/// fitted to measurements. It is deliberately conservative: a tolerance tuned
-/// tight against one machine's observed error becomes a flaky test on the next.
-///
-/// Measured against it on an Apple M5 Pro (uniform random weights and `x` in
-/// `[-0.5, 0.5]`, so `max|term| = 0.25`): 1000 nnz/row gave a real deviation of
-/// 3.3e-6 against a bound of 2.4e-4, i.e. ~70x of margin.
-///
-/// The reason a fixed tolerance does not work here is that the error grows with
-/// row density. A constant `1e-4` passes trivially on a 3x3 fixture and stops
-/// meaning anything by the time rows hold a thousand entries.
 /// Upper bound on the CPU/GPU disagreement for an elementwise kernel.
 ///
 /// An elementwise update has no summation and therefore no reduction order to
@@ -399,10 +396,36 @@ pub fn tolerance_for_elementwise(max_abs_result: f32) -> f32 {
     2.0 * f32::EPSILON * magnitude
 }
 
-pub fn tolerance_for_nnz_per_row(nnz_per_row: usize, max_abs_term: f32) -> f32 {
-    let n = nnz_per_row.max(1) as f32;
-    let magnitude = max_abs_term.abs().max(f32::MIN_POSITIVE);
-    8.0 * f32::EPSILON * n * magnitude
+/// Upper bound on the CPU/GPU disagreement for one `y += A · x` row.
+///
+/// The operation being bounded is `y_out = y_in + Σ w_i · x_i`, and the bound
+/// has to cover *both* halves of that. An earlier version covered only the row
+/// sum, taking `max|w·x|` as the magnitude that matters. That is wrong whenever
+/// the incoming `y` is larger than any single product: the final accumulation
+/// rounds at the magnitude of the *result*, so a row whose terms are tiny but
+/// whose running total is not gets a tolerance far below its real error.
+///
+/// A 50,000-case fuzz found it: 380 rows over one column, terms bounded by
+/// 0.06, result 0.756. Predicted 5.7e-8, observed 6e-8. Small, and a genuine
+/// failure of the model rather than noise.
+///
+/// So the bound is the textbook recursive-summation form over both parts:
+///
+/// ```text
+/// 8 · eps · (max_row_nnz · max|w·x|  +  max|y|)
+/// ```
+///
+/// with a factor of 8 of headroom. `max_row_nnz` is the longest row, not the
+/// mean — see [`SparseShape::nnz_per_row`] for why that distinction bites.
+///
+/// It is deliberately a bound, not a curve fitted to one machine's measured
+/// error. A tolerance tuned tight against one GPU becomes a flaky test on the
+/// next.
+pub fn tolerance_for_spmv(max_row_nnz: usize, max_abs_term: f32, max_abs_result: f32) -> f32 {
+    let n = max_row_nnz.max(1) as f32;
+    let term = max_abs_term.abs().max(f32::MIN_POSITIVE);
+    let result = max_abs_result.abs().max(f32::MIN_POSITIVE);
+    8.0 * f32::EPSILON * n.mul_add(term, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +768,7 @@ impl SparseOp {
     /// On Metal this reduces each row with `simd_sum`, a tree reduction whose
     /// order differs from both CPU arms and from [`SparseOp::spmv`]. Expect it
     /// to land further from the CPU reference than plain SpMV does; size any
-    /// comparison with [`tolerance_for_nnz_per_row`].
+    /// comparison with [`tolerance_for_spmv`].
     pub fn fused_spmv_lif(
         &self,
         x: &[f32],
@@ -813,13 +836,24 @@ fn validate_csr(csr: &Csr, ncols: usize) -> Result<SparseShape, SparsePlanError>
 
     let nrows = csr.row_ptr.len() - 1;
     let nnz = csr.col.len();
+    // Monotonicity is already established above, so every difference is
+    // non-negative and this cannot underflow.
+    let max_row_nnz = (0..nrows)
+        .map(|r| (csr.row_ptr[r + 1] - csr.row_ptr[r]) as usize)
+        .max()
+        .unwrap_or(0);
     for (what, value) in [("nrows", nrows), ("ncols", ncols), ("nnz", nnz)] {
         if value > u32::MAX as usize {
             return Err(SparsePlanError::TooLarge { what, value });
         }
     }
 
-    Ok(SparseShape { nrows, ncols, nnz })
+    Ok(SparseShape {
+        nrows,
+        ncols,
+        nnz,
+        max_row_nnz,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +1011,7 @@ mod tolerance_tests {
     /// A tolerance is the one thing in a differential suite that can fail
     /// upward: widen it enough and every comparison passes while proving
     /// nothing. A mutation that returned `f32::MAX` from
-    /// `tolerance_for_nnz_per_row` was invisible to the entire suite. These
+    /// `tolerance_for_spmv` was invisible to the entire suite. These
     /// bounds close that: the tolerance has to stay small enough to still be a
     /// test.
     #[test]
@@ -985,7 +1019,7 @@ mod tolerance_tests {
         // The M5 Pro measurement that calibrated this: 1000 nnz/row with terms
         // bounded by 0.25 deviated by 3.3e-6.
         let measured_worst_case = 3.3e-6f32;
-        let t = tolerance_for_nnz_per_row(1000, 0.25);
+        let t = tolerance_for_spmv(1000, 0.25, 0.25);
         assert!(
             t > measured_worst_case,
             "tolerance {t} is below the deviation actually observed ({measured_worst_case}); \
@@ -1004,9 +1038,12 @@ mod tolerance_tests {
     }
 
     #[test]
-    fn tolerance_grows_with_row_density_and_magnitude() {
-        assert!(tolerance_for_nnz_per_row(10, 1.0) < tolerance_for_nnz_per_row(1000, 1.0));
-        assert!(tolerance_for_nnz_per_row(100, 1.0) < tolerance_for_nnz_per_row(100, 10.0));
+    fn tolerance_grows_with_row_density_result_and_magnitude() {
+        assert!(tolerance_for_spmv(10, 1.0, 1.0) < tolerance_for_spmv(1000, 1.0, 1.0));
+        assert!(tolerance_for_spmv(100, 1.0, 1.0) < tolerance_for_spmv(100, 10.0, 1.0));
+        // The result magnitude must move the bound too. This is the axis whose
+        // absence let the soak failure through.
+        assert!(tolerance_for_spmv(100, 1.0, 1.0) < tolerance_for_spmv(100, 1.0, 50.0));
     }
 
     /// Degenerate arguments must still yield a usable positive tolerance rather
@@ -1017,7 +1054,7 @@ mod tolerance_tests {
     #[test]
     fn degenerate_arguments_yield_finite_positive_tolerances() {
         for (n, mag) in [(0usize, 0.0f32), (0, 1.0), (1, 0.0), (usize::MAX, 1.0)] {
-            let t = tolerance_for_nnz_per_row(n, mag);
+            let t = tolerance_for_spmv(n, mag, mag);
             assert!(t > 0.0 && t.is_finite(), "n={n} mag={mag} gave {t}");
         }
         for mag in [0.0f32, -1.0, f32::MIN_POSITIVE] {

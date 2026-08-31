@@ -15,7 +15,7 @@
 //!
 //! Bit-reproducibility holds *within* a backend, never *across* one. CPU and
 //! GPU reduce in different orders and will differ in the last few ulps; see
-//! [`backend::tolerance_for_nnz_per_row`].
+//! [`backend::tolerance_for_spmv`].
 //!
 //! **2. A backend handle cannot lie about what ran.** [`backend::Device`] is
 //! only constructible for a substrate that can actually execute, and
@@ -34,9 +34,8 @@ pub mod sparse;
 pub mod time;
 
 pub use backend::{
-    available_backends, tolerance_for_elementwise, tolerance_for_nnz_per_row, Backend,
-    BackendUnavailable, Device, LifParams, LifParamsError, OpError, SparseOp, SparsePlanError,
-    SparseShape,
+    available_backends, tolerance_for_elementwise, tolerance_for_spmv, Backend, BackendUnavailable,
+    Device, LifParams, LifParamsError, OpError, SparseOp, SparsePlanError, SparseShape,
 };
 pub use buffer::Buffer;
 pub use rng::Rng;

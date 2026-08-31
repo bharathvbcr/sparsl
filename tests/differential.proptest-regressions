@@ -10,3 +10,9 @@
 # running every time regardless of how it was found: a 1x1 operator with no
 # edges, which exercises the zero-nnz allocation and empty-dispatch paths.
 cc ebbfaacbdc37f6503b88180f2e1b1af673a63aa4a6c6955b2f06692340afbed7 # shrinks to nrows = 1, ncols = 1, max_deg = 0, seed = 0
+# Found by the scheduled soak (50,000 cases) on 2026-08-31, not by the 48-case
+# per-push fuzz. A ragged operator: 380 rows over a single column, degree 0..2,
+# so nearly every row is empty and the mean degree rounds to 1 — while the rows
+# that do have entries have two. See the tolerance discussion in
+# `tolerance_for_nnz_per_row`.
+cc 75087e490a4e93fd45e7c60d35be505f74278e8ce1eddac54ff0035b7fc8cebf

@@ -37,6 +37,19 @@ pub fn max_abs_term(weights: &[f32], x: &[f32]) -> f32 {
     (w * xm).max(f32::MIN_POSITIVE)
 }
 
+/// Largest absolute value in a slice, floored so it is never zero.
+///
+/// Feeds the result-magnitude half of `tolerance_for_spmv`.
+pub fn max_abs(values: &[f32]) -> f32 {
+    values.iter().fold(f32::MIN_POSITIVE, |m, v| {
+        if v.is_finite() {
+            m.max(v.abs())
+        } else {
+            m
+        }
+    })
+}
+
 /// Every backend that can execute, minus the CPU reference itself.
 pub fn backends_under_test() -> Vec<Backend> {
     sparsl::available_backends()

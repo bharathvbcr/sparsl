@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use common::*;
 use sparsl::{
-    tolerance_for_nnz_per_row, Csr, Device, LifParams, LifParamsError, OpError, Rng, SparseOp,
+    tolerance_for_spmv, Csr, Device, LifParams, LifParamsError, OpError, Rng, SparseOp,
     SparsePlanError,
 };
 
@@ -406,9 +406,9 @@ fn a_single_very_long_row_is_handled() {
     for backend in backends_under_test() {
         let device = Device::try_new(backend).expect("available");
         let op = device.prepare(&csr, ncols, &weights).expect("valid");
-        let tol = tolerance_for_nnz_per_row(nnz, max_abs_term(&weights, &x));
         let mut y = vec![0.0f32; 1];
         op.spmv(&x, &mut y).expect("spmv");
+        let tol = tolerance_for_spmv(nnz, max_abs_term(&weights, &x), max_abs(&y_ref));
         assert!(
             (y[0] - y_ref[0]).abs() <= tol,
             "{}: single {nnz}-entry row gave {} vs reference {} (tol {tol})",
