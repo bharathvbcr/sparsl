@@ -102,6 +102,7 @@ pub struct MetalDevice {
     queue: CommandQueue,
     spmv: ComputePipelineState,
     spmv_t: ComputePipelineState,
+    spmm: ComputePipelineState,
     lif: ComputePipelineState,
     fused: ComputePipelineState,
 }
@@ -143,6 +144,7 @@ impl MetalDevice {
 
         let spmv = pipeline("csr_spmv_kernel")?;
         let spmv_t = pipeline("csc_spmv_t_kernel")?;
+        let spmm = pipeline("csr_spmm_kernel")?;
         let lif = pipeline("lif_integrate_kernel")?;
         let fused = pipeline("fused_spmv_lif_simdgroup_kernel")?;
 
@@ -182,6 +184,7 @@ impl MetalDevice {
             queue,
             spmv,
             spmv_t,
+            spmm,
             lif,
             fused,
         })
@@ -296,6 +299,9 @@ impl MetalDevice {
                 Some(_) => Some(self.alloc::<f32>(shape.nrows, "xt")?),
                 None => None,
             },
+            // Allocated on the first `spmm`, because nothing here knows
+            // `n_vec` yet.
+            batch: None,
             v: self.alloc_guarded::<f32>(shape.nrows, "v")?,
             theta: self.alloc_guarded::<f32>(shape.nrows, "theta")?,
             spikes: self.alloc_guarded::<u8>(shape.nrows, "spikes")?,
@@ -443,6 +449,14 @@ struct Scratch {
     yt: Option<Guarded>,
     /// Row-length input for the transposed product.
     xt: Option<Buffer>,
+    /// Batched operands for `spmm`, and the `n_vec` they were sized for.
+    ///
+    /// `n_vec` is a per-call quantity, so unlike every other buffer here these
+    /// cannot be sized at `prepare` time. They grow on demand and are then
+    /// kept: W0's measurements put allocation, not dispatch, at the expensive
+    /// end of a Metal call, so reallocating per call would give back exactly
+    /// the advantage batching is meant to buy.
+    batch: Option<BatchScratch>,
     v: Guarded,
     theta: Guarded,
     spikes: Guarded,
@@ -462,6 +476,15 @@ pub struct MetalSparse {
     transpose: Option<TransposeIndex>,
     shape: SparseShape,
     scratch: Mutex<Scratch>,
+}
+
+/// Batched `spmm` operands, sized for `n_vec` vectors.
+struct BatchScratch {
+    x: Buffer,
+    y: Guarded,
+    /// The `n_vec` `x` and `y` were allocated for. A request above this
+    /// reallocates; at or below it reuses, binding only the prefix in use.
+    n_vec: usize,
 }
 
 /// CSC device buffers backing `csc_spmv_t_kernel`.
@@ -501,6 +524,85 @@ impl MetalSparse {
         scratch.y.assert_intact();
         read_into(&scratch.y.buffer, y);
         drop(scratch);
+    }
+
+    /// `Y += A · X` for `n_vec` vectors. Lengths are checked by the caller in
+    /// `SparseOp::spmm`.
+    ///
+    /// Grows the batch scratch when `n_vec` exceeds what it was sized for and
+    /// reuses it otherwise, binding only the prefix in use. The buffers are not
+    /// shrunk: a caller that alternates batch sizes should pay the larger
+    /// allocation once, not on every downward step.
+    pub fn spmm(&self, x: &[f32], n_vec: usize, y: &mut [f32]) -> Result<(), OpError> {
+        // `csr_spmm_kernel` derives its row from `id / n_vec`, and `n_vec` is a
+        // runtime value, so that is a hardware integer division in every
+        // thread. At a batch of one it buys nothing and cost 0.92 ms against
+        // SpMV's 0.52 ms at n = 10000. Dispatching to the scalar kernel also
+        // makes the documented bit-identity structural on this backend rather
+        // than a property the two kernels happen to share.
+        if n_vec == 1 {
+            self.spmv(x, y);
+            return Ok(());
+        }
+        let mut scratch = self.scratch.lock().expect("sparsl scratch mutex poisoned");
+        let need_x = self.shape.ncols * n_vec;
+        let need_y = self.shape.nrows * n_vec;
+
+        let grow = match &scratch.batch {
+            Some(b) => b.n_vec < n_vec,
+            None => true,
+        };
+        if grow {
+            let x_buf = self
+                .device
+                .alloc::<f32>(need_x.max(1), "spmm x")
+                .map_err(|_| OpError::Length {
+                    what: "spmm x scratch",
+                    expected: need_x,
+                    got: 0,
+                })?;
+            let y_buf = self
+                .device
+                .alloc_guarded::<f32>(need_y.max(1), "spmm y")
+                .map_err(|_| OpError::Length {
+                    what: "spmm y scratch",
+                    expected: need_y,
+                    got: 0,
+                })?;
+            scratch.batch = Some(BatchScratch {
+                x: x_buf,
+                y: y_buf,
+                n_vec,
+            });
+        }
+        let batch = scratch
+            .batch
+            .as_ref()
+            .expect("batch scratch allocated directly above");
+
+        write_from(&batch.x, &x[..need_x]);
+        batch.y.write(&y[..need_y]);
+
+        let tg = self.device.threadgroup_for(&self.device.spmm);
+        let cb = self.device.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.device.spmm);
+        enc.set_buffer(0, Some(&self.row_ptr), 0);
+        enc.set_buffer(1, Some(&self.col), 0);
+        enc.set_buffer(2, Some(&self.values), 0);
+        enc.set_buffer(3, Some(&batch.x), 0);
+        enc.set_buffer(4, Some(&batch.y.buffer), 0);
+        set_u32(enc, 5, self.shape.nrows as u32);
+        set_u32(enc, 6, n_vec as u32);
+        enc.dispatch_threads(size(need_y as u64), size(tg));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        batch.y.assert_intact();
+        read_into(&batch.y.buffer, &mut y[..need_y]);
+        drop(scratch);
+        Ok(())
     }
 
     /// Whether this operator carries a reverse index.

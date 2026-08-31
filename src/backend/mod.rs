@@ -913,6 +913,72 @@ impl SparseOp {
         }
     }
 
+    /// `Y += A · X` for a batch of `n_vec` dense vectors.
+    ///
+    /// # Layout
+    ///
+    /// `x` and `y` are **batch-minor**: `x[c * n_vec + v]` is column `c` of
+    /// vector `v`, so all `n_vec` values for a column are adjacent. That is the
+    /// opposite of storing each vector contiguously, and it is deliberate — it
+    /// is what lets adjacent GPU threads read and write adjacent addresses. See
+    /// `csr_spmm_kernel` for the full argument.
+    ///
+    /// # Why this exists
+    ///
+    /// A single-vector [`SparseOp::spmv`] gives the GPU one multiply-add per
+    /// loaded index, which is not enough work to cover the load: on this
+    /// crate's own measurements Metal does not overtake the rayon arm until
+    /// roughly 20M non-zeros. Reusing each `weights[i]` and each `col[i]`
+    /// across `n_vec` vectors is what changes that ratio.
+    ///
+    /// A batch of one is bit-identical to [`SparseOp::spmv`] on the same
+    /// backend, not merely within tolerance: both traverse a row's non-zeros in
+    /// the same order.
+    pub fn spmm(&self, x: &[f32], n_vec: usize, y: &mut [f32]) -> Result<(), OpError> {
+        if n_vec == 0 {
+            return Err(OpError::Length {
+                what: "n_vec",
+                expected: 1,
+                got: 0,
+            });
+        }
+        let need_x = self
+            .shape
+            .ncols()
+            .checked_mul(n_vec)
+            .ok_or(OpError::Length {
+                what: "x",
+                expected: usize::MAX,
+                got: n_vec,
+            })?;
+        let need_y = self
+            .shape
+            .nrows()
+            .checked_mul(n_vec)
+            .ok_or(OpError::Length {
+                what: "y",
+                expected: usize::MAX,
+                got: n_vec,
+            })?;
+        require_min_len("x", x.len(), need_x)?;
+        require_len("y", y.len(), need_y)?;
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu { csr, weights, .. } => {
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_spmm_parallel(csr, weights, x, n_vec, y);
+                } else {
+                    cpu_spmm_sequential(csr, weights, x, n_vec, y);
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.spmm(x, n_vec, y),
+        }
+    }
+
     /// Whether [`SparseOp::spmv_t`] can run on this operator.
     pub fn has_transpose(&self) -> bool {
         match &self.resident {
@@ -1060,6 +1126,92 @@ fn cpu_spmv_t_parallel(csc: &Csc, weights: &[f32], x: &[f32], y: &mut [f32]) {
     y.par_iter_mut().enumerate().for_each(|(c, y_val)| {
         *y_val += col_dot(csc, weights, x, c);
     });
+}
+
+/// One output row of `Y += A · X` for all `n_vec` vectors at once.
+///
+/// `x` and `y` are batch-minor (`[n][n_vec]`), matching `csr_spmm_kernel`. The
+/// inner loop is over the row's non-zeros and the innermost over the batch, so
+/// each `weights[i]` is loaded once and reused `n_vec` times, and both operands
+/// are walked contiguously.
+///
+/// The traversal order over `i` is identical to [`row_dot`], so a batch of one
+/// produces bit-identical results to [`SparseOp::spmv`] rather than merely
+/// close ones — which is what makes that a usable test rather than a tolerance
+/// argument.
+///
+/// # Why this tiles instead of accumulating straight into `out`
+///
+/// The obvious shape — `out[v] += w * x[base + v]` over the row's non-zeros —
+/// accumulates into *memory*, one load-modify-store per non-zero per vector,
+/// where [`row_dot`] keeps its running sum in a register. Measured at
+/// `n_vec = 1`, n = 5000, that cost 42.7 ms against SpMV's 0.95 ms: a batched
+/// call was 45x slower than the scalar one it was meant to subsume.
+///
+/// Accumulating a tile of vectors in a stack array fixes it without giving up
+/// what batching is for. Each `weights[i]` is still loaded once per tile, `x`
+/// is still walked contiguously, and the accumulators stay in registers.
+/// [`BATCH_TILE`] is the tile width; a row with fewer vectors than that simply
+/// runs one short tile.
+#[inline]
+fn row_dot_batched(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, r: usize, out: &mut [f32]) {
+    let start = csr.row_ptr[r] as usize;
+    let end = csr.row_ptr[r + 1] as usize;
+    let mut v0 = 0usize;
+    while v0 < n_vec {
+        let width = BATCH_TILE.min(n_vec - v0);
+        let mut acc = [0.0f32; BATCH_TILE];
+        // Zipped rather than indexed by `i`: same order, so the documented
+        // bit-identity with `row_dot` holds, and the bounds checks on both
+        // slices go away.
+        for (&w, &col) in weights[start..end].iter().zip(&csr.col[start..end]) {
+            let base = col as usize * n_vec + v0;
+            // The slices make the width known to the optimiser at the point of
+            // use, so the tile stays in registers rather than being indexed.
+            for (a, xv) in acc[..width].iter_mut().zip(&x[base..base + width]) {
+                *a += w * xv;
+            }
+        }
+        for (o, a) in out[v0..v0 + width].iter_mut().zip(&acc[..width]) {
+            *o += *a;
+        }
+        v0 += width;
+    }
+}
+
+/// Vectors accumulated in registers at once by [`row_dot_batched`].
+///
+/// Sixteen f32 accumulators is two 8-wide NEON registers, which fits the
+/// register file alongside the row pointers without spilling.
+const BATCH_TILE: usize = 16;
+
+fn cpu_spmm_sequential(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, y: &mut [f32]) {
+    // A batch of one has nothing to batch, and the tiled accumulator carries
+    // setup that a single vector cannot amortise: measured 39.7 ms against
+    // SpMV's 10.6 ms at n = 10000 before this branch existed. The scalar path
+    // is already the best implementation of this case, and dispatching to it
+    // keeps the documented bit-identity trivially true rather than merely
+    // arranged for.
+    if n_vec == 1 {
+        cpu_spmv_sequential(csr, weights, x, y);
+        return;
+    }
+    for (r, row_out) in y.chunks_mut(n_vec).enumerate() {
+        row_dot_batched(csr, weights, x, n_vec, r, row_out);
+    }
+}
+
+fn cpu_spmm_parallel(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+    if n_vec == 1 {
+        cpu_spmv_parallel(csr, weights, x, y);
+        return;
+    }
+    y.par_chunks_mut(n_vec)
+        .enumerate()
+        .for_each(|(r, row_out)| {
+            row_dot_batched(csr, weights, x, n_vec, r, row_out);
+        });
 }
 
 fn cpu_spmv_sequential(csr: &Csr, weights: &[f32], x: &[f32], y: &mut [f32]) {

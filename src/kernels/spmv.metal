@@ -141,3 +141,53 @@ kernel void csc_spmv_t_kernel(
     }
     y[id] += sum;
 }
+
+/// Y += A * X for a batch of `n_vec` dense vectors, one thread per output
+/// element.
+///
+/// # Layout: the batch index moves fastest
+///
+/// `X` is `[ncols][n_vec]` and `Y` is `[nrows][n_vec]` — all `n_vec` values for
+/// a column sit adjacent, not all columns for a vector. That is the opposite of
+/// how a batch is usually written, and it is the whole reason this kernel is
+/// worth having.
+///
+/// Thread `id` covers `(row, v)` with `v = id % n_vec`. Adjacent threads differ in
+/// `v` and share `row`, so:
+///
+///   - they read `X[col[i] * n_vec + v]` at adjacent addresses — one coalesced
+///     transaction instead of `n_vec` scattered ones;
+///   - they write `Y[row * n_vec + v]` at adjacent addresses, likewise;
+///   - they walk the *same* `col[i]` sequence, so the index loads are a
+///     broadcast rather than divergent traffic.
+///
+/// Stored batch-major (`X` as `[n_vec][ncols]`) every one of those becomes a
+/// scattered access, because adjacent threads would then hold different rows
+/// and therefore different `col[i]`.
+///
+/// Column indices are unchecked here for the same reason as `csr_spmv_kernel`:
+/// `SparseOp::prepare` validated them before upload.
+kernel void csr_spmm_kernel(
+    device const uint*  row_ptr [[buffer(0)]],
+    device const uint*  col_ind [[buffer(1)]],
+    device const float* values  [[buffer(2)]],
+    device const float* x       [[buffer(3)]],
+    device float*       y       [[buffer(4)]],
+    constant uint&      n_rows  [[buffer(5)]],
+    constant uint&      n_vec   [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    const uint total = n_rows * n_vec;
+    if (id >= total) { return; }
+    const uint row = id / n_vec;
+    const uint v   = id - row * n_vec;
+    uint row_start = row_ptr[row];
+    uint row_end   = row_ptr[row + 1];
+    float sum = 0.0f;
+    // Same traversal order as `csr_spmv_kernel`, so a batch of one is
+    // bit-identical to a plain SpMV rather than merely close to it.
+    for (uint i = row_start; i < row_end; ++i) {
+        sum += values[i] * x[col_ind[i] * n_vec + v];
+    }
+    y[id] += sum;
+}

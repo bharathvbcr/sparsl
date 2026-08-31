@@ -172,6 +172,26 @@ stateDiagram-v2
 
 That note is the reason the differential suite treats spikes inside a tolerance band around threshold as legitimately ambiguous, and demands exact agreement everywhere else.
 
+### The batched product
+
+`SparseOp::spmm` computes `Y += A · X` for `n_vec` dense vectors in one dispatch.
+
+A single-vector SpMV performs one multiply-add per index it loads, which is not enough arithmetic to cover the load — that is why the GPU arm needs a large problem before it overtakes rayon at all. Batching reuses each `weights[i]` and each `col[i]` across every vector, which is a change in arithmetic intensity rather than in parallelism.
+
+`x` and `y` are **batch-minor**: `x[c * n_vec + v]` is column `c` of vector `v`. That is the opposite of storing each vector contiguously, and it is the entire point — adjacent GPU threads then differ only in `v`, so they read adjacent addresses, write adjacent addresses, and share the same `col[i]` sequence as a broadcast. Batch-major storage turns all three into scattered access.
+
+A batch of one is **bit-identical** to `spmv` on every backend, not merely within tolerance. Both dispatch to the same scalar path, and the test asserts equality of raw bit patterns — which fails on any reassociation or stray fused multiply-add that a tolerance would absorb.
+
+| n | nnz | n_vec | repeated `spmv` (ms) | `spmm` (ms) | same-backend speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 50K | 8 | 2.360 | 0.247 | **9.6×** |
+| 1,000 | 50K | 32 | 8.009 | 0.355 | **22.5×** |
+| 5,000 | 1.25M | 8 | 3.013 | 0.358 | **8.4×** |
+| 5,000 | 1.25M | 32 | 10.926 | 0.945 | **11.6×** |
+| 10,000 | 5M | 32 | 19.106 | 1.464 | **13.1×** |
+
+Metal GPU, `cargo run --release --features metal --example batch_crossover`. These compare `spmm` against `n_vec` separate `spmv` calls **on the same backend**, so machine load affects both arms alike. Cross-backend numbers are deliberately absent: they were taken at load average 49, where the rayon arm is contending for cores and Metal is not, and a crossover measured under that says more about the machine than the kernels.
+
 ### The transposed product
 
 `SparseOp::spmv_t` computes `y += Aᵀ · x` — the direction a gradient travels. Given `dy` over a sparse layer's outputs it produces `dx` over its inputs, which is what a learning rule needs and what a forward-only SpMV cannot give.
@@ -326,11 +346,10 @@ Re-verification after the fixes: every former survivor is now caught.
 
 ## 🧭 Known gaps
 
-Recorded rather than implied. Everything the crate *contains* is wired, tested and documented; these are capabilities it does not have yet.
+Recorded rather than implied. Everything the crate *contains* is wired, tested and documented; these are capabilities it does not have yet. **SpMM shipped** — see [The batched product](#the-batched-product).
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
-| **SpMM** — sparse × dense *matrix* | A single-vector SpMV leaves the GPU mostly idle, which is why Metal only overtakes rayon at N ≥ 10,000. A batch dimension would make it win at every size. | Needs its own tiling and tolerance analysis; a batched reduction has a different error bound from the per-row one `tolerance_for_spmv` derives. |
 | **GPU scan** | `assoc_scan` is one of the crate's two headline primitives and is rayon-only. | The chunked scan's bit-identity guarantee rests on a sequential left-fold at chunk boundaries; reproducing that exactly on a GPU is a design question, not a port. |
 | **f16 / bf16 / bitpacked spikes** | SpMV is bandwidth-bound, so f16 is a straight 2x. A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. |
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |

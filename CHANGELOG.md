@@ -8,6 +8,16 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ### Added
 
+- **`SparseOp::spmm` — batched sparse matrix times dense matrix**, `Y += A·X`
+  over `n_vec` vectors, on both CPU arms and Metal. Batching raises arithmetic
+  intensity rather than parallelism: each `weights[i]` and `col[i]` is loaded
+  once and reused across the batch. Measured 9.6× to 22.5× against the same
+  number of separate `spmv` calls on the same Metal device.
+- Operands are batch-minor (`x[c * n_vec + v]`), which is what lets adjacent
+  GPU threads read and write adjacent addresses and share one `col[i]` stream.
+- A batch of one is bit-identical to `spmv` on every backend, asserted on raw
+  bit patterns rather than within a tolerance.
+- `csr_spmm_kernel` in `spmv.metal`, and `examples/batch_crossover.rs`.
 - **`SparseOp::spmv_t` — transposed sparse matrix-vector product**, `y += Aᵀ·x`,
   on both CPU arms and Metal. This is the direction a gradient travels; without
   it there is no backward pass through a sparse layer. Opt in with

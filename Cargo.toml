@@ -56,3 +56,7 @@ proptest = "1"
 [[example]]
 name = "crossover"
 required-features = ["metal"]
+
+[[example]]
+name = "batch_crossover"
+required-features = ["metal"]
