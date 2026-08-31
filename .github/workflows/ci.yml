@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # 05:10 UTC daily, for the soak job below only.
+    - cron: '10 5 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -143,3 +146,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
       - run: cargo check --locked --features metal
+
+  # ---------------------------------------------------------------------------
+  # Soak. Scheduled and manual only — too slow for every push.
+  #
+  # The per-push fuzz runs 48 random shapes so it stays fast. That is enough to
+  # catch a broken kernel and nowhere near enough to trust the tail. This runs
+  # 50,000, and repeats the whole suite to catch anything intermittent: the
+  # concurrency test and the GPU dispatch paths are where a flake would hide,
+  # and a flake that appears once in fifty runs is a real defect, not noise.
+  # ---------------------------------------------------------------------------
+  soak:
+    name: soak (scheduled)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Differential fuzz, 50k random shapes
+        env:
+          PROPTEST_CASES: 50000
+        run: cargo test --features metal --release --test differential
+      - name: Repeat the full suite to surface intermittents
+        run: |
+          for i in $(seq 1 12); do
+            echo "::group::run $i"
+            cargo test --features metal --release --all-targets
+            echo "::endgroup::"
+          done

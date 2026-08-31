@@ -238,8 +238,24 @@ fn lif_integrate_matches_reference() {
     }
 }
 
+/// Number of random cases the fuzz below runs.
+///
+/// `ProptestConfig::with_cases(n)` is built from `Config::default()` and then
+/// overwrites `cases`, so an explicit literal silently defeats the standard
+/// `PROPTEST_CASES` environment variable — a knob that looks like it works and
+/// does nothing. Reading it here restores it.
+///
+/// 48 by default so an ordinary `cargo test` stays fast. Raise it for a soak:
+/// `PROPTEST_CASES=5000 cargo test --features metal --release --test differential`.
+fn proptest_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
     /// Random shapes and random data, every available backend against the
     /// reference. The shape table above covers the boundaries we know about;
