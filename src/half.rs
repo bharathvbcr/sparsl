@@ -1,4 +1,10 @@
-//! IEEE 754 binary16 (`f16`) storage, as raw `u16` bits.
+//! Narrow 16-bit float storage, as raw `u16` bits.
+//!
+//! Two formats, and the difference between them is the whole reason both
+//! exist. IEEE binary16 spends its 16 bits as 1+5+10, buying precision and
+//! paying for it with a range that stops at 65504. bfloat16 spends them as
+//! 1+8+7 — f32's exponent field, truncated significand — so it cannot overflow
+//! anything f32 holds, and is 8x coarser than binary16 in exchange.
 //!
 //! Rust's `f16` is still unstable, and this crate's MSRV is 1.82, so the type
 //! is carried as its bit pattern and converted explicitly. That is not purely a
@@ -155,6 +161,59 @@ pub fn f32_slice_to_f16(values: &[f32]) -> Vec<u16> {
     values.iter().copied().map(f32_to_f16_bits).collect()
 }
 
+// ---------------------------------------------------------------------------
+// bfloat16
+// ---------------------------------------------------------------------------
+
+/// Machine epsilon of bfloat16: `2^-7`, the ulp at 1.0.
+///
+/// 65536x [`f32::EPSILON`] and 8x [`HALF_EPSILON`]. bfloat16 is the coarser of
+/// the two narrow formats by a wide margin — it trades significand bits for
+/// f32's exponent range, not for precision.
+pub const BF16_EPSILON: f32 = 7.812_5e-3;
+
+/// Widen bfloat16 bits to `f32`. Exact, and a pure bit shift.
+///
+/// bfloat16 *is* the top half of an f32: same sign, same 8-bit exponent, the
+/// significand simply truncated. Nothing to renormalise, no subnormal case, no
+/// exponent rebias — which is why this format is cheap to produce and why it
+/// has no counterpart to binary16's overflow at 65504.
+#[inline]
+pub fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// Narrow `f32` to bfloat16 bits, round-to-nearest-even.
+///
+/// Shares f32's exponent field, so it does not overflow at 65504 the way
+/// binary16 does — that is the reason to reach for this format when the
+/// weights' *range* is the problem rather than their precision.
+///
+/// It is not overflow-*proof*, and an earlier version of this comment claimed
+/// it was. With 7 significand bits the largest finite bfloat16 is 3.3895e38
+/// against f32's 3.4028e38, so f32 values above roughly 3.396e38 — the top
+/// 0.4% of the range — round up to infinity. `f32::MAX` is one of them. The
+/// window is far narrower than binary16's, not absent.
+#[inline]
+pub fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        // Truncating a NaN whose payload lives in the low 16 bits would produce
+        // an infinity. Force the quiet bit so it stays a NaN.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    // Round-to-nearest-even: add half an ulp, plus one more when the surviving
+    // bit is already odd, then truncate. Matches what the hardware does, which
+    // is what keeps the host encoding and Metal's `bfloat` in agreement.
+    let bias = 0x7fff + ((bits >> 16) & 1);
+    ((bits + bias) >> 16) as u16
+}
+
+/// Narrow a slice to bfloat16 bits.
+pub fn f32_slice_to_bf16(values: &[f32]) -> Vec<u16> {
+    values.iter().copied().map(f32_to_bf16_bits).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +240,63 @@ mod tests {
         }
     }
 
+    /// Exhaustive, as for binary16: all 65536 bfloat16 values round-trip.
+    #[test]
+    fn every_bf16_round_trips_through_f32() {
+        for bits in 0u16..=u16::MAX {
+            let wide = bf16_bits_to_f32(bits);
+            let back = f32_to_bf16_bits(wide);
+            let is_nan = (bits & 0x7f80) == 0x7f80 && (bits & 0x007f) != 0;
+            if is_nan {
+                assert!(wide.is_nan(), "0x{bits:04X} widened to a non-NaN");
+                assert_eq!(back & 0x7f80, 0x7f80, "0x{bits:04X} lost its NaN class");
+                assert_ne!(back & 0x007f, 0, "0x{bits:04X} became an infinity");
+            } else {
+                assert_eq!(back, bits, "0x{bits:04X} -> {wide} -> 0x{back:04X}");
+            }
+        }
+    }
+
+    /// Where the two formats' ranges actually differ, and where they do not.
+    #[test]
+    fn bf16_reaches_far_past_binary16_but_still_has_a_ceiling() {
+        // 70000 is past binary16's ceiling and nowhere near bfloat16's.
+        assert_eq!(f32_to_f16_bits(70_000.0), 0x7c00);
+        assert!(bf16_bits_to_f32(f32_to_bf16_bits(70_000.0)).is_finite());
+        for v in [1e38f32, -1e38, 3.0e38, -3.0e38] {
+            assert!(
+                bf16_bits_to_f32(f32_to_bf16_bits(v)).is_finite(),
+                "{v} should stay finite in bfloat16"
+            );
+        }
+
+        // But it is a ceiling, not the absence of one. The largest finite
+        // bfloat16 is 0x7F7F; f32 values above roughly half an ulp past it
+        // round to infinity, and `f32::MAX` is above that line.
+        let largest_finite = bf16_bits_to_f32(0x7f7f);
+        assert_eq!(f32_to_bf16_bits(largest_finite), 0x7f7f);
+        assert!(largest_finite < f32::MAX);
+        assert!(
+            bf16_bits_to_f32(f32_to_bf16_bits(f32::MAX)).is_infinite(),
+            "f32::MAX rounds past the largest finite bfloat16"
+        );
+        assert!(bf16_bits_to_f32(f32_to_bf16_bits(f32::INFINITY)).is_infinite());
+    }
+
+    #[test]
+    fn bf16_rounding_is_ties_to_even() {
+        // ulp at 1.0 is 2^-7. 1 + 2^-8 sits exactly halfway between 1.0 and
+        // 1 + 2^-7; ties-to-even picks 1.0, whose significand ends in 0.
+        let half_ulp = 1.0f32 + 2.0f32.powi(-8);
+        assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(half_ulp)), 1.0);
+        // The next tie up rounds away from the odd neighbour.
+        let next = 1.0f32 + 2.0f32.powi(-7) + 2.0f32.powi(-8);
+        assert_eq!(
+            bf16_bits_to_f32(f32_to_bf16_bits(next)),
+            1.0 + 2.0f32.powi(-6)
+        );
+    }
+
     #[test]
     fn the_documented_constants_are_the_values_they_name() {
         assert_eq!(f16_bits_to_f32(0x7bff), HALF_MAX);
@@ -188,6 +304,9 @@ mod tests {
         // Same convention as `f32::EPSILON`: the ulp at 1.0, not unit roundoff.
         assert_eq!(HALF_EPSILON, 2.0f32.powi(-10));
         assert_eq!(HALF_EPSILON / f32::EPSILON, 8192.0);
+        assert_eq!(BF16_EPSILON, 2.0f32.powi(-7));
+        assert_eq!(BF16_EPSILON / f32::EPSILON, 65536.0);
+        assert_eq!(BF16_EPSILON / HALF_EPSILON, 8.0);
     }
 
     #[test]

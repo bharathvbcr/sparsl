@@ -126,6 +126,7 @@ pub struct MetalDevice {
     queue: CommandQueue,
     spmv: ComputePipelineState,
     spmv_f16: ComputePipelineState,
+    spmv_bf16: ComputePipelineState,
     spmv_t: ComputePipelineState,
     spmm: ComputePipelineState,
     scan_chunk: ComputePipelineState,
@@ -210,6 +211,7 @@ impl MetalDevice {
 
         let spmv = pipeline("csr_spmv_kernel")?;
         let spmv_f16 = pipeline("csr_spmv_f16_kernel")?;
+        let spmv_bf16 = pipeline("csr_spmv_bf16_kernel")?;
         let spmv_t = pipeline("csc_spmv_t_kernel")?;
         let spmm = pipeline("csr_spmm_kernel")?;
         let scan_chunk = pipeline("scan_chunk")?;
@@ -254,6 +256,7 @@ impl MetalDevice {
             queue,
             spmv,
             spmv_f16,
+            spmv_bf16,
             spmv_t,
             spmm,
             scan_chunk,
@@ -357,7 +360,7 @@ impl MetalDevice {
         shape: SparseShape,
         weights: &[f32],
         csc: Option<&Csc>,
-        narrow: bool,
+        precision: super::WeightPrecision,
     ) -> Result<MetalSparse, SparsePlanError> {
         let row_ptr = self.upload(&csr.row_ptr, "row_ptr")?;
         let col = self.upload(&csr.col, "col")?;
@@ -365,10 +368,9 @@ impl MetalDevice {
         // The host encoder is cross-checked against Metal's own widening in
         // `tests/half_backend.rs`, so "same bits, two spellings" is tested
         // rather than assumed.
-        let values_f16 = if narrow {
-            Some(self.upload(&crate::half::f32_slice_to_f16(weights), "values_f16")?)
-        } else {
-            None
+        let values_narrow = match precision.narrow_bits(weights) {
+            Some(bits) => Some(self.upload(&bits, "values_narrow")?),
+            None => None,
         };
         let values = self.upload(weights, "values")?;
         let transpose = match csc {
@@ -405,7 +407,8 @@ impl MetalDevice {
             row_ptr,
             col,
             values,
-            values_f16,
+            values_narrow,
+            precision,
             transpose,
             shape,
             scratch: Mutex::new(scratch),
@@ -643,11 +646,14 @@ pub struct MetalSparse {
     /// The operator's values, resident for its lifetime. Uploading these per
     /// call is what made the GPU arm lose to rayon at every size.
     values: Buffer,
-    /// binary16 weights, present only for an operator built by
-    /// [`crate::Device::prepare_f16`]. When set, `values` holds the same
+    /// Narrow weights — binary16 or bfloat16 — present only for an operator
+    /// built by [`crate::Device::prepare_f16`] or
+    /// [`crate::Device::prepare_bf16`]. When set, `values` holds the same
     /// weights widened back to f32 so `set_weights` and the CPU-comparable
     /// path stay available; the kernel reads this one.
-    values_f16: Option<Buffer>,
+    values_narrow: Option<Buffer>,
+    /// Which format `values_narrow` holds, and therefore which kernel runs.
+    precision: super::WeightPrecision,
     /// Reverse index, present only when the operator was prepared for it.
     /// `edge_idx` points into `values`, so both directions read one table.
     transpose: Option<TransposeIndex>,
@@ -679,8 +685,11 @@ impl MetalSparse {
         // weights the operator was built with while `values` reported the new
         // ones — the exact "two copies that drift" failure the transpose index
         // was designed to avoid by sharing one table.
-        if let Some(narrow) = self.values_f16.as_ref() {
-            write_from(narrow, &crate::half::f32_slice_to_f16(weights));
+        if let (Some(buffer), Some(bits)) = (
+            self.values_narrow.as_ref(),
+            self.precision.narrow_bits(weights),
+        ) {
+            write_from(buffer, &bits);
         }
     }
 
@@ -693,9 +702,10 @@ impl MetalSparse {
         // One operator, two kernels: the narrow one reads `values_f16` and is
         // selected by the operator's own storage, not by a caller-supplied
         // flag that could disagree with what was uploaded.
-        let (pipeline, values) = match self.values_f16.as_ref() {
-            Some(narrow) => (&self.device.spmv_f16, narrow),
-            None => (&self.device.spmv, &self.values),
+        let (pipeline, values) = match (self.precision, self.values_narrow.as_ref()) {
+            (super::WeightPrecision::F16, Some(narrow)) => (&self.device.spmv_f16, narrow),
+            (super::WeightPrecision::Bf16, Some(narrow)) => (&self.device.spmv_bf16, narrow),
+            _ => (&self.device.spmv, &self.values),
         };
         let tg = self.device.threadgroup_for(pipeline);
         let cb = self
@@ -808,9 +818,9 @@ impl MetalSparse {
         Ok(())
     }
 
-    /// Whether this operator's weights are stored as binary16.
-    pub fn weights_are_f16(&self) -> bool {
-        self.values_f16.is_some()
+    /// The storage this operator's weights occupy.
+    pub fn weight_precision(&self) -> super::WeightPrecision {
+        self.precision
     }
 
     /// Whether this operator carries a reverse index.

@@ -493,6 +493,76 @@ pub fn tolerance_for_spmv(max_row_nnz: usize, max_abs_term: f32, max_abs_result:
     8.0 * f32::EPSILON * n.mul_add(term, result)
 }
 
+/// How an operator stores its weights.
+///
+/// Storage only. Every kernel widens to `f32` and accumulates there — see
+/// [`crate::half`] for why a 500-term row sum at 16-bit width is not an option.
+///
+/// This is an enum rather than the boolean it replaced. A second format made
+/// the boolean wrong: two flags would have admitted a state meaning "both
+/// binary16 and bfloat16", which no operator can be in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WeightPrecision {
+    /// f32. The default, and the only one with no quantisation error.
+    #[default]
+    F32,
+    /// IEEE binary16: 1+5+10. Finer than bfloat16, but overflows at 65504.
+    F16,
+    /// bfloat16: 1+8+7. f32's exponent range, 8x coarser than binary16.
+    Bf16,
+}
+
+impl WeightPrecision {
+    /// Bytes one weight occupies in device memory.
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
+    /// Machine epsilon of the storage format, the ulp at 1.0.
+    ///
+    /// What the quantisation term of a tolerance is built from.
+    pub fn epsilon(self) -> f32 {
+        match self {
+            Self::F32 => f32::EPSILON,
+            Self::F16 => crate::half::HALF_EPSILON,
+            Self::Bf16 => crate::half::BF16_EPSILON,
+        }
+    }
+
+    /// Round `weights` through this format, as `prepare` stores them.
+    fn quantise(self, weights: &[f32]) -> Option<Vec<f32>> {
+        use crate::half::*;
+        match self {
+            Self::F32 => None,
+            Self::F16 => Some(
+                weights
+                    .iter()
+                    .map(|w| f16_bits_to_f32(f32_to_f16_bits(*w)))
+                    .collect(),
+            ),
+            Self::Bf16 => Some(
+                weights
+                    .iter()
+                    .map(|w| bf16_bits_to_f32(f32_to_bf16_bits(*w)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The narrow bit patterns a device buffer is filled from.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn narrow_bits(self, weights: &[f32]) -> Option<Vec<u16>> {
+        match self {
+            Self::F32 => None,
+            Self::F16 => Some(crate::half::f32_slice_to_f16(weights)),
+            Self::Bf16 => Some(crate::half::f32_slice_to_bf16(weights)),
+        }
+    }
+}
+
 /// Upper bound on a `y += A · x` row when the weights are stored as binary16.
 ///
 /// The README used to record "narrower types need their bounds re-derived, not
@@ -522,10 +592,50 @@ pub fn tolerance_for_spmv(max_row_nnz: usize, max_abs_term: f32, max_abs_result:
 ///
 /// [`HALF_EPSILON`]: crate::half::HALF_EPSILON
 pub fn tolerance_for_spmv_f16(max_row_nnz: usize, max_abs_term: f32, max_abs_result: f32) -> f32 {
+    tolerance_for_spmv_narrow(
+        WeightPrecision::F16,
+        max_row_nnz,
+        max_abs_term,
+        max_abs_result,
+    )
+}
+
+/// [`tolerance_for_spmv_f16`] for bfloat16 weights.
+///
+/// The same derivation with a coarser constant: [`crate::half::BF16_EPSILON`]
+/// is 8x [`crate::half::HALF_EPSILON`], so this bound is roughly 8x looser.
+/// That is the trade bfloat16 makes — f32's exponent range for three
+/// significand bits — stated as a number rather than a preference.
+pub fn tolerance_for_spmv_bf16(max_row_nnz: usize, max_abs_term: f32, max_abs_result: f32) -> f32 {
+    tolerance_for_spmv_narrow(
+        WeightPrecision::Bf16,
+        max_row_nnz,
+        max_abs_term,
+        max_abs_result,
+    )
+}
+
+/// The derivation both narrow bounds share, parameterised by the storage.
+///
+/// One formula rather than one per format. A third narrow type would add a
+/// [`WeightPrecision`] variant and nothing here, which is the point: the
+/// analysis does not depend on which 16-bit layout was chosen, only on its
+/// epsilon.
+pub fn tolerance_for_spmv_narrow(
+    precision: WeightPrecision,
+    max_row_nnz: usize,
+    max_abs_term: f32,
+    max_abs_result: f32,
+) -> f32 {
     let n = max_row_nnz.max(1) as f32;
     let term = max_abs_term.abs().max(f32::MIN_POSITIVE);
-    let quantisation = 8.0 * n * crate::half::HALF_EPSILON * term;
-    quantisation + tolerance_for_spmv(max_row_nnz, max_abs_term, max_abs_result)
+    let accumulation = tolerance_for_spmv(max_row_nnz, max_abs_term, max_abs_result);
+    match precision {
+        // f32 storage quantises nothing; adding a term for it would double-count
+        // rounding that `tolerance_for_spmv` already covers.
+        WeightPrecision::F32 => accumulation,
+        _ => 8.0 * n * precision.epsilon() * term + accumulation,
+    }
 }
 
 /// Upper bound on the disagreement between two backends' prefix scans.
@@ -736,7 +846,14 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(self.clone(), csr, ncols, weights, false, false)
+        SparseOp::prepare(
+            self.clone(),
+            csr,
+            ncols,
+            weights,
+            false,
+            WeightPrecision::F32,
+        )
     }
 
     /// [`Device::prepare`] with the weights stored as IEEE binary16.
@@ -744,7 +861,7 @@ impl Device {
     /// Takes f32 weights and narrows them. On `Backend::Metal` the SpMV kernel
     /// then streams 2 bytes per non-zero instead of 4. `col_ind` stays 4 bytes,
     /// so traffic per non-zero goes 8 to 6 — a 25% cut, not the 2x that halving
-    /// one of the two arrays might suggest. `examples/f16_crossover.rs`
+    /// one of the two arrays might suggest. `examples/narrow_crossover.rs`
     /// measures what that is actually worth.
     ///
     /// # Both arms store the same values
@@ -762,7 +879,7 @@ impl Device {
     /// It stores the quantised values back as f32, so it pays the precision and
     /// saves no bandwidth. Stated rather than hidden: this entry point exists
     /// for the GPU, and a CPU operator built with it is for checking the GPU
-    /// rather than for going faster. [`SparseOp::weights_are_f16`] reports the
+    /// rather than for going faster. [`SparseOp::weight_precision`] reports the
     /// storage an operator actually has.
     ///
     /// # Range
@@ -777,7 +894,63 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(self.clone(), csr, ncols, weights, false, true)
+        SparseOp::prepare(
+            self.clone(),
+            csr,
+            ncols,
+            weights,
+            false,
+            WeightPrecision::F16,
+        )
+    }
+
+    /// [`Device::prepare`] with an explicit storage format.
+    ///
+    /// The general form. [`Device::prepare`], [`Device::prepare_f16`] and
+    /// [`Device::prepare_bf16`] are named conveniences over it, and exist
+    /// because a call site reading `prepare_bf16` says more than one reading
+    /// `prepare_with(.., Bf16)`. Reach for this when the format is a variable
+    /// — a benchmark sweeping the options, or a caller choosing from config.
+    pub fn prepare_with(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+        precision: WeightPrecision,
+    ) -> Result<SparseOp, SparsePlanError> {
+        SparseOp::prepare(self.clone(), csr, ncols, weights, false, precision)
+    }
+
+    /// [`Device::prepare`] with the weights stored as bfloat16.
+    ///
+    /// The other narrow option. Against [`Device::prepare_f16`] the trade is
+    /// range for precision: bfloat16 carries f32's exponent field, so it does
+    /// not hit binary16's 65504 ceiling, and it is 8x coarser in exchange.
+    /// Neither is a default — which is right depends on the weights, and
+    /// [`tolerance_for_spmv_bf16`] prices the difference.
+    ///
+    /// Bandwidth is identical: both store 2 bytes per weight. On the measured
+    /// shapes that is worth a few percent, not a doubling; see
+    /// `examples/narrow_crossover.rs`.
+    ///
+    /// Everything [`Device::prepare_f16`] documents about *where* the error
+    /// lives applies unchanged — the weights are quantised once before either
+    /// backend stores anything, so a CPU/GPU comparison is still bounded by
+    /// [`tolerance_for_spmv`].
+    pub fn prepare_bf16(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+    ) -> Result<SparseOp, SparsePlanError> {
+        SparseOp::prepare(
+            self.clone(),
+            csr,
+            ncols,
+            weights,
+            false,
+            WeightPrecision::Bf16,
+        )
     }
 
     /// [`Device::prepare`], plus the reverse index [`SparseOp::spmv_t`] needs.
@@ -796,7 +969,14 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(self.clone(), csr, ncols, weights, true, false)
+        SparseOp::prepare(
+            self.clone(),
+            csr,
+            ncols,
+            weights,
+            true,
+            WeightPrecision::F32,
+        )
     }
 
     /// Inclusive scan over affine maps, on this device's substrate.
@@ -915,14 +1095,14 @@ enum OpResident {
 pub struct SparseOp {
     device: Device,
     shape: SparseShape,
-    /// Whether this operator was built by [`Device::prepare_f16`].
+    /// The storage this operator was built with.
     ///
-    /// Kept because `set_weights` has to preserve the storage contract. Without
-    /// it a narrow operator quietly stopped being narrow on the first update:
-    /// the CPU arm took the raw f32 while a freshly prepared operator held the
+    /// Kept because `set_weights` has to preserve the contract. Without it a
+    /// narrow operator quietly stopped being narrow on the first update: the
+    /// CPU arm took the raw f32 while a freshly prepared operator held the
     /// quantised values, so the two disagreed on weights the caller believed
     /// were the same.
-    narrow: bool,
+    precision: WeightPrecision,
     resident: OpResident,
 }
 
@@ -942,7 +1122,7 @@ impl SparseOp {
         ncols: usize,
         weights: &[f32],
         transpose: bool,
-        narrow: bool,
+        precision: WeightPrecision,
     ) -> Result<Self, SparsePlanError> {
         let shape = validate_csr(csr, ncols)?;
         if weights.len() != shape.nnz {
@@ -964,16 +1144,8 @@ impl SparseOp {
         // values and differ only in how many bytes they spend on them, so a
         // CPU/GPU comparison is still bounded by `tolerance_for_spmv` — the
         // binary16 error is in the operator, not between the backends.
-        let quantised;
-        let weights = if narrow {
-            quantised = crate::half::f32_slice_to_f16(weights)
-                .into_iter()
-                .map(crate::half::f16_bits_to_f32)
-                .collect::<Vec<f32>>();
-            &quantised[..]
-        } else {
-            weights
-        };
+        let quantised = precision.quantise(weights);
+        let weights = quantised.as_deref().unwrap_or(weights);
 
         let csc = match transpose {
             true => Some(csr.to_csc_rect(ncols).map_err(|_| {
@@ -1000,13 +1172,13 @@ impl SparseOp {
             },
             #[cfg(all(target_os = "macos", feature = "metal"))]
             DeviceInner::Metal(d) => {
-                OpResident::Metal(d.prepare(csr, shape, weights, csc.as_ref(), narrow)?)
+                OpResident::Metal(d.prepare(csr, shape, weights, csc.as_ref(), precision)?)
             }
         };
         Ok(Self {
             device,
             shape,
-            narrow,
+            precision,
             resident,
         })
     }
@@ -1033,16 +1205,8 @@ impl SparseOp {
         // Same quantisation `prepare` applied, for the same reason: an operator
         // built narrow stays narrow, and every backend keeps storing the same
         // values as every other.
-        let quantised;
-        let weights = if self.narrow {
-            quantised = crate::half::f32_slice_to_f16(weights)
-                .into_iter()
-                .map(crate::half::f16_bits_to_f32)
-                .collect::<Vec<f32>>();
-            &quantised[..]
-        } else {
-            weights
-        };
+        let quantised = self.precision.quantise(weights);
+        let weights = quantised.as_deref().unwrap_or(weights);
         match &mut self.resident {
             OpResident::Cpu {
                 weights: stored, ..
@@ -1183,17 +1347,21 @@ impl SparseOp {
         }
     }
 
-    /// Whether this operator's weights are stored as binary16.
+    /// The storage this operator's weights actually occupy.
     ///
-    /// True only for a Metal operator built by [`Device::prepare_f16`]. A CPU
-    /// operator built the same way holds *quantised* values in f32 storage, so
-    /// it reports `false` — the flag describes the storage that exists, not the
-    /// entry point that was called.
-    pub fn weights_are_f16(&self) -> bool {
+    /// Narrow only for a Metal operator. A CPU operator built by
+    /// [`Device::prepare_f16`] or [`Device::prepare_bf16`] holds *quantised*
+    /// values in f32 storage, so it reports [`WeightPrecision::F32`] — this
+    /// describes the storage that exists, not the entry point that was
+    /// called.
+    pub fn weight_precision(&self) -> WeightPrecision {
         match &self.resident {
-            OpResident::Cpu { .. } => false,
+            // The CPU arm holds quantised values in f32 storage: it pays the
+            // precision and saves no bytes, so reporting anything else would
+            // overstate what it does.
+            OpResident::Cpu { .. } => WeightPrecision::F32,
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            OpResident::Metal(op) => op.weights_are_f16(),
+            OpResident::Metal(op) => op.weight_precision(),
         }
     }
 

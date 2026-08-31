@@ -65,6 +65,32 @@ kernel void csr_spmv_f16_kernel(
     y[id] += sum;
 }
 
+/// y += A * x with bfloat16 weights, one thread per row.
+///
+/// Identical to `csr_spmv_f16_kernel` but for the storage format. bfloat16 is
+/// f32 with the low 16 significand bits dropped, so it keeps f32's exponent
+/// range — no 65504 ceiling — and pays 8x the rounding error of binary16.
+/// Which trade is right depends on the weights, so both are offered and
+/// neither is a default.
+kernel void csr_spmv_bf16_kernel(
+    device const uint*   row_ptr [[buffer(0)]],
+    device const uint*   col_ind [[buffer(1)]],
+    device const bfloat* values  [[buffer(2)]],
+    device const float*  x       [[buffer(3)]],
+    device float*        y       [[buffer(4)]],
+    constant uint&       n_rows  [[buffer(5)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= n_rows) { return; }
+    uint row_start = row_ptr[id];
+    uint row_end   = row_ptr[id + 1];
+    float sum = 0.0f;
+    for (uint i = row_start; i < row_end; ++i) {
+        sum += float(values[i]) * x[col_ind[i]];
+    }
+    y[id] += sum;
+}
+
 /// LIF membrane decay, threshold, spike, reset and adaptive threshold bump.
 kernel void lif_integrate_kernel(
     device float*       v           [[buffer(0)]],

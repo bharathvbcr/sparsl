@@ -36,8 +36,9 @@ pub mod time;
 
 pub use backend::{
     available_backends, tolerance_for_elementwise, tolerance_for_scan, tolerance_for_spmv,
-    tolerance_for_spmv_f16, Backend, BackendUnavailable, Device, LifParams, LifParamsError,
-    OpError, SparseOp, SparsePlanError, SparseShape,
+    tolerance_for_spmv_bf16, tolerance_for_spmv_f16, tolerance_for_spmv_narrow, Backend,
+    BackendUnavailable, Device, LifParams, LifParamsError, OpError, SparseOp, SparsePlanError,
+    SparseShape, WeightPrecision,
 };
 pub use buffer::Buffer;
 pub use rng::Rng;

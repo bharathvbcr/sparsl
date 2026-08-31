@@ -1,4 +1,4 @@
-//! What does binary16 weight storage actually buy?
+//! What does narrow weight storage actually buy?
 //!
 //! The README predicted "a straight 2x", on the grounds that SpMV is
 //! bandwidth-bound and f16 halves the weights. That reasoning skips a term: the
@@ -45,8 +45,10 @@ fn main() {
         let x: Vec<f32> = (0..n).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
 
         let wide = gpu.prepare(&csr, n, &w).expect("prepare");
-        let narrow = gpu.prepare_f16(&csr, n, &w).expect("prepare_f16");
-        assert!(narrow.weights_are_f16());
+        let f16 = gpu.prepare_f16(&csr, n, &w).expect("prepare_f16");
+        let bf16 = gpu.prepare_bf16(&csr, n, &w).expect("prepare_bf16");
+        assert_eq!(f16.weight_precision(), sparsl::WeightPrecision::F16);
+        assert_eq!(bf16.weight_precision(), sparsl::WeightPrecision::Bf16);
 
         // A single dispatch is dominated by launch jitter — the first version
         // of this reported spreads up to 2.09, which by the rule above means
@@ -62,28 +64,29 @@ fn main() {
             }) / REPS as f64
         };
 
-        // Ramp both arms before timing either.
+        // Ramp every arm before timing any.
         for _ in 0..3 {
             run(&wide);
-            run(&narrow);
+            run(&f16);
+            run(&bf16);
         }
 
-        let w1 = run(&wide);
-        let n1 = run(&narrow);
+        let (a1, b1, c1) = (run(&wide), run(&f16), run(&bf16));
         // Reversed.
-        let n2 = run(&narrow);
-        let w2 = run(&wide);
+        let (c2, b2, a2) = (run(&bf16), run(&f16), run(&wide));
 
         let best = |a: f64, b: f64| a.min(b);
         let spread = |a: f64, b: f64| a.max(b) / a.min(b).max(f64::MIN_POSITIVE);
-        let (wt, nt) = (best(w1, w2), best(n1, n2));
+        let (wt, ft, bt) = (best(a1, a2), best(b1, b2), best(c1, c2));
 
         println!(
-            "n = {n:>6}  nnz = {:>9}   f32 {wt:>7.3} ms (spread {:.2})   f16 {nt:>7.3} ms (spread {:.2})   {:.2}x",
+            "n = {n:>6}  nnz = {:>9}   f32 {wt:>6.3} ms   f16 {ft:>6.3} ms ({:.2}x)   bf16 {bt:>6.3} ms ({:.2}x)   spreads {:.2}/{:.2}/{:.2}",
             csr.nnz(),
-            spread(w1, w2),
-            spread(n1, n2),
-            wt / nt
+            wt / ft,
+            wt / bt,
+            spread(a1, a2),
+            spread(b1, b2),
+            spread(c1, c2)
         );
     }
 }

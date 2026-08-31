@@ -8,6 +8,16 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ### Added
 
+- **bfloat16 weight storage**, alongside binary16. `Device::prepare_bf16`, or
+  `Device::prepare_with` when the format is a variable. The two are
+  indistinguishable in speed — both store 2 bytes — so the choice is numerical:
+  binary16 is 8x finer, bfloat16 reaches 3.39e38 instead of stopping at 65504.
+- `WeightPrecision`, replacing the boolean `prepare` threaded through. A second
+  format made the boolean wrong: two flags would have admitted a state meaning
+  "both binary16 and bfloat16", which no operator can be in.
+- `tolerance_for_spmv_narrow`, the one derivation both narrow bounds delegate
+  to, parameterised by the format's epsilon. A third narrow type would add a
+  `WeightPrecision` variant and no new formula.
 - **IEEE binary16 weight storage.** `Device::prepare_f16` narrows the weights;
   `Backend::Metal` then streams 2 bytes per non-zero instead of 4.
   `SparseOp::weights_are_f16` reports the storage an operator actually has.

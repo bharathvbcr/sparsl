@@ -320,15 +320,17 @@ Read this cautiously. The example exercises every arm before timing any of them 
 
 The honest summary: `rayon` wins the middle of the range, Metal pulls ahead at the top by a margin that is not large, and below roughly 5,000 non-zeros per row the sequential arm beats both because neither parallel substrate earns its dispatch overhead.
 
-### binary16 weights buy less than the arithmetic suggests
+### narrow weights buy less than the arithmetic suggests
 
-`cargo run --release --features metal --example f16_crossover` — `Device::prepare_f16` stores weights as IEEE binary16 and the kernel widens them on load. Three runs, each arm timed in both orders and averaged over 20 dispatches:
+`cargo run --release --features metal --example narrow_crossover` — the weights are stored 16-bit and the kernel widens them on load. Three runs, each arm timed in both orders and averaged over 20 dispatches:
 
-| n | nnz | f32 weights | f16 weights | speedup |
+| n | nnz | f32 | binary16 | bfloat16 |
 | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 5M | 0.47–0.57 ms | 0.43–0.49 ms | 1.02–1.17x |
-| 20,000 | 20M | 1.22–1.40 ms | 1.21–1.29 ms | 1.06–1.13x |
-| 50,000 | 20M | 1.51–1.79 ms | 1.63–1.68 ms | 1.02–1.06x |
+| 10,000 | 5M | 0.46–0.49 ms | 1.14–1.29x | 1.08–1.35x |
+| 20,000 | 20M | 1.28–1.39 ms | 1.07–1.11x | 1.03–1.08x |
+| 50,000 | 20M | 1.70–1.89 ms | 1.02–1.15x | 1.06–1.18x |
+
+The two narrow formats are indistinguishable from each other, which is what should happen: both store 2 bytes, so they move identical traffic. **Choose between them on numerics, never on speed.**
 
 This table used to predict "a straight 2x". That was wrong twice over.
 
@@ -336,7 +338,18 @@ First, the arithmetic. The kernel streams `col_ind` (4 bytes) *and* `values` (4 
 
 Second, even 1.33x is not reached, and the likely reason is the term neither figure counts: `x[col_ind[i]]` is a random gather, its cost is unchanged by narrowing the weights, and it is a large share of the real work. Supporting rather than proving that: the win is largest at n = 10,000, where `x` is 40 KB and gather-friendly, and smallest at n = 50,000, where it is 200 KB.
 
-So binary16 is worth a few percent here, not a doubling. It ships because the derivation it forced — [`tolerance_for_spmv_f16`](src/backend/mod.rs) — is the thing that was actually blocking narrow types, and bf16 can now follow the same route.
+So narrow storage is worth a few percent here, not a doubling. It ships because the derivation it forced — [`tolerance_for_spmv_narrow`](src/backend/mod.rs) — is what was actually blocking narrow types, and it is one formula parameterised by the format's epsilon rather than one per format.
+
+#### Which narrow format
+
+| | binary16 | bfloat16 |
+| --- | --- | --- |
+| layout | 1+5+10 | 1+8+7 |
+| epsilon | 2⁻¹⁰, 8192x f32 | 2⁻⁷, 65536x f32 |
+| largest finite | 65504 | 3.3895e38 |
+| bound | `tolerance_for_spmv_f16` | `tolerance_for_spmv_bf16`, ~8x looser |
+
+binary16 is 8x finer; bfloat16 reaches five orders of magnitude further before overflowing. Neither is a default. bfloat16 is *not* overflow-proof either — with 7 significand bits its largest finite value is 3.3895e38 against f32's 3.4028e38, so the top 0.4% of the f32 range, `f32::MAX` included, still rounds to infinity.
 
 ---
 
@@ -397,7 +410,7 @@ Recorded rather than implied. Everything the crate *contains* is wired, tested a
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
-| **bf16 / bitpacked spikes** | A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. f16 has now been done that way — see [binary16 weights](#binary16-weights-buy-less-than-the-arithmetic-suggests) — and bf16 would follow the same route. |
+| **bitpacked spikes** | A spike is one *bit*, not 32. Narrow *weights* are done; this is the other axis, and the one with real headroom — 32x on the input side rather than the 25% that halving the weights moves. | Needs a different kernel, not a different tolerance: the operand stops being a float, so the error analysis that unblocked binary16 and bfloat16 does not carry over. |
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
 
 ---
