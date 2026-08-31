@@ -6,6 +6,20 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **IEEE binary16 weight storage.** `Device::prepare_f16` narrows the weights;
+  `Backend::Metal` then streams 2 bytes per non-zero instead of 4.
+  `SparseOp::weights_are_f16` reports the storage an operator actually has.
+- `crate::half`: binary16 encode/decode as raw `u16`, because Rust's `f16` is
+  unstable and this crate's MSRV is 1.82. Verified exhaustively — all 65536
+  binary16 values round-trip — and the host encoder is cross-checked against
+  Metal's own `half` through the real SpMV.
+- `tolerance_for_spmv_f16`, the derivation the README named as the blocker for
+  narrow types. It is `tolerance_for_spmv` plus a quantisation term rather than
+  a separate formula, so the two cannot drift; the quantisation term dominates
+  by ~8192x, which is `HALF_EPSILON / f32::EPSILON`.
+
 ### Changed
 
 - `tolerance_for_scan` is public, and `tests/scan_backend.rs` asserts against it

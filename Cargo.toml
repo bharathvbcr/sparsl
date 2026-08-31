@@ -70,6 +70,10 @@ name = "scan_crossover"
 required-features = ["metal"]
 
 [[example]]
+name = "f16_crossover"
+required-features = ["metal"]
+
+[[example]]
 name = "crossover"
 required-features = ["metal"]
 

@@ -34,6 +34,37 @@ kernel void csr_spmv_kernel(
     y[id] += sum;
 }
 
+/// y += A * x with binary16 weights, one thread per row.
+///
+/// The only difference from `csr_spmv_kernel` is the width of `values`: 2 bytes
+/// per non-zero instead of 4. `col_ind` stays 4, so the streamed traffic per
+/// non-zero goes 8 -> 6 bytes, a 25% cut and not the 2x that halving one array
+/// suggests.
+///
+/// `half` widens to `float` on load and the accumulator is `float`. binary16
+/// has an 11-bit significand and overflows at 65504; a 500-term row sum
+/// accumulated at that width would admit a relative error near 24% and could
+/// overflow outright. Narrow storage, wide arithmetic — see
+/// `tolerance_for_spmv_f16` for the bound this earns.
+kernel void csr_spmv_f16_kernel(
+    device const uint*  row_ptr [[buffer(0)]],
+    device const uint*  col_ind [[buffer(1)]],
+    device const half*  values  [[buffer(2)]],
+    device const float* x       [[buffer(3)]],
+    device float*       y       [[buffer(4)]],
+    constant uint&      n_rows  [[buffer(5)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= n_rows) { return; }
+    uint row_start = row_ptr[id];
+    uint row_end   = row_ptr[id + 1];
+    float sum = 0.0f;
+    for (uint i = row_start; i < row_end; ++i) {
+        sum += float(values[i]) * x[col_ind[i]];
+    }
+    y[id] += sum;
+}
+
 /// LIF membrane decay, threshold, spike, reset and adaptive threshold bump.
 kernel void lif_integrate_kernel(
     device float*       v           [[buffer(0)]],

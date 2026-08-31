@@ -493,6 +493,41 @@ pub fn tolerance_for_spmv(max_row_nnz: usize, max_abs_term: f32, max_abs_result:
     8.0 * f32::EPSILON * n.mul_add(term, result)
 }
 
+/// Upper bound on a `y += A · x` row when the weights are stored as binary16.
+///
+/// The README used to record "narrower types need their bounds re-derived, not
+/// rescaled" as the reason f16 was missing. This is that derivation.
+///
+/// Three error sources, not one, and they are not the same size:
+///
+/// 1. **Quantising the weights.** Each stored `w` is `fl16(w)`, so it carries a
+///    relative error up to `HALF_EPSILON / 2` before any arithmetic happens.
+///    Over a row this contributes `n · HALF_EPSILON · max|w·x|`.
+/// 2. **Forming the products** in f32, once widened.
+/// 3. **Accumulating** them in f32, the usual recursive-summation term.
+///
+/// Sources 2 and 3 are exactly [`tolerance_for_spmv`], so this is that bound
+/// plus the quantisation term rather than a separate formula — the two cannot
+/// drift apart, and the delegation is what says the arithmetic is still f32:
+///
+/// ```text
+/// 8 · n · HALF_EPSILON · max|w·x|   +   tolerance_for_spmv(n, max|w·x|, max|y|)
+/// ```
+///
+/// The first term dominates by roughly 8192x, which is the ratio of
+/// [`HALF_EPSILON`] to [`f32::EPSILON`]. Put plainly: with binary16 weights the
+/// error is set by how coarsely the weights were stored, and the accumulation
+/// is nearly free by comparison. That is the trade being made, and it is why
+/// nothing here accumulates in binary16 — see [`crate::half`].
+///
+/// [`HALF_EPSILON`]: crate::half::HALF_EPSILON
+pub fn tolerance_for_spmv_f16(max_row_nnz: usize, max_abs_term: f32, max_abs_result: f32) -> f32 {
+    let n = max_row_nnz.max(1) as f32;
+    let term = max_abs_term.abs().max(f32::MIN_POSITIVE);
+    let quantisation = 8.0 * n * crate::half::HALF_EPSILON * term;
+    quantisation + tolerance_for_spmv(max_row_nnz, max_abs_term, max_abs_result)
+}
+
 /// Upper bound on the disagreement between two backends' prefix scans.
 ///
 /// [`Device::assoc_scan`] is the one operation here whose *algorithm* differs
@@ -701,7 +736,48 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(self.clone(), csr, ncols, weights, false)
+        SparseOp::prepare(self.clone(), csr, ncols, weights, false, false)
+    }
+
+    /// [`Device::prepare`] with the weights stored as IEEE binary16.
+    ///
+    /// Takes f32 weights and narrows them. On `Backend::Metal` the SpMV kernel
+    /// then streams 2 bytes per non-zero instead of 4. `col_ind` stays 4 bytes,
+    /// so traffic per non-zero goes 8 to 6 — a 25% cut, not the 2x that halving
+    /// one of the two arrays might suggest. `examples/f16_crossover.rs`
+    /// measures what that is actually worth.
+    ///
+    /// # Both arms store the same values
+    ///
+    /// The weights are quantised once, before either backend stores anything,
+    /// so a CPU operator built this way holds exactly the values the GPU one
+    /// does. A CPU/GPU comparison is therefore still bounded by
+    /// [`tolerance_for_spmv`]: the binary16 error lives *in the operator*, not
+    /// between the backends. Comparing against what the unquantised weights
+    /// would have given is the other question, and [`tolerance_for_spmv_f16`]
+    /// bounds that one.
+    ///
+    /// # The CPU arm gains nothing here
+    ///
+    /// It stores the quantised values back as f32, so it pays the precision and
+    /// saves no bandwidth. Stated rather than hidden: this entry point exists
+    /// for the GPU, and a CPU operator built with it is for checking the GPU
+    /// rather than for going faster. [`SparseOp::weights_are_f16`] reports the
+    /// storage an operator actually has.
+    ///
+    /// # Range
+    ///
+    /// binary16 overflows at 65504 and its smallest normal is 6.1e-5. Weights
+    /// outside that become infinities or flush toward zero; this does not
+    /// rescale them to fit, because a silent rescale would change the operator
+    /// the caller asked for.
+    pub fn prepare_f16(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+    ) -> Result<SparseOp, SparsePlanError> {
+        SparseOp::prepare(self.clone(), csr, ncols, weights, false, true)
     }
 
     /// [`Device::prepare`], plus the reverse index [`SparseOp::spmv_t`] needs.
@@ -720,7 +796,7 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(self.clone(), csr, ncols, weights, true)
+        SparseOp::prepare(self.clone(), csr, ncols, weights, true, false)
     }
 
     /// Inclusive scan over affine maps, on this device's substrate.
@@ -839,6 +915,14 @@ enum OpResident {
 pub struct SparseOp {
     device: Device,
     shape: SparseShape,
+    /// Whether this operator was built by [`Device::prepare_f16`].
+    ///
+    /// Kept because `set_weights` has to preserve the storage contract. Without
+    /// it a narrow operator quietly stopped being narrow on the first update:
+    /// the CPU arm took the raw f32 while a freshly prepared operator held the
+    /// quantised values, so the two disagreed on weights the caller believed
+    /// were the same.
+    narrow: bool,
     resident: OpResident,
 }
 
@@ -858,6 +942,7 @@ impl SparseOp {
         ncols: usize,
         weights: &[f32],
         transpose: bool,
+        narrow: bool,
     ) -> Result<Self, SparsePlanError> {
         let shape = validate_csr(csr, ncols)?;
         if weights.len() != shape.nnz {
@@ -875,6 +960,21 @@ impl SparseOp {
         // column is below `ncols`, so this cannot fail — but it is checked
         // rather than unwrapped, because the alternative is a panic reaching a
         // caller who passed a perfectly ordinary non-square operator.
+        // Quantise before either arm stores anything. Both then hold the same
+        // values and differ only in how many bytes they spend on them, so a
+        // CPU/GPU comparison is still bounded by `tolerance_for_spmv` — the
+        // binary16 error is in the operator, not between the backends.
+        let quantised;
+        let weights = if narrow {
+            quantised = crate::half::f32_slice_to_f16(weights)
+                .into_iter()
+                .map(crate::half::f16_bits_to_f32)
+                .collect::<Vec<f32>>();
+            &quantised[..]
+        } else {
+            weights
+        };
+
         let csc = match transpose {
             true => Some(csr.to_csc_rect(ncols).map_err(|_| {
                 // Unreachable: `validate_csr` above proved every stored column
@@ -900,12 +1000,13 @@ impl SparseOp {
             },
             #[cfg(all(target_os = "macos", feature = "metal"))]
             DeviceInner::Metal(d) => {
-                OpResident::Metal(d.prepare(csr, shape, weights, csc.as_ref())?)
+                OpResident::Metal(d.prepare(csr, shape, weights, csc.as_ref(), narrow)?)
             }
         };
         Ok(Self {
             device,
             shape,
+            narrow,
             resident,
         })
     }
@@ -929,6 +1030,19 @@ impl SparseOp {
     /// The path a learning rule uses: connectivity is fixed, values move.
     pub fn set_weights(&mut self, weights: &[f32]) -> Result<(), OpError> {
         require_len("weights", weights.len(), self.shape.nnz())?;
+        // Same quantisation `prepare` applied, for the same reason: an operator
+        // built narrow stays narrow, and every backend keeps storing the same
+        // values as every other.
+        let quantised;
+        let weights = if self.narrow {
+            quantised = crate::half::f32_slice_to_f16(weights)
+                .into_iter()
+                .map(crate::half::f16_bits_to_f32)
+                .collect::<Vec<f32>>();
+            &quantised[..]
+        } else {
+            weights
+        };
         match &mut self.resident {
             OpResident::Cpu {
                 weights: stored, ..
@@ -1066,6 +1180,20 @@ impl SparseOp {
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             OpResident::Metal(op) => op.spmm(x, n_vec, y),
+        }
+    }
+
+    /// Whether this operator's weights are stored as binary16.
+    ///
+    /// True only for a Metal operator built by [`Device::prepare_f16`]. A CPU
+    /// operator built the same way holds *quantised* values in f32 storage, so
+    /// it reports `false` — the flag describes the storage that exists, not the
+    /// entry point that was called.
+    pub fn weights_are_f16(&self) -> bool {
+        match &self.resident {
+            OpResident::Cpu { .. } => false,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.weights_are_f16(),
         }
     }
 

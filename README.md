@@ -320,6 +320,26 @@ Read this cautiously. The example exercises every arm before timing any of them 
 
 The honest summary: `rayon` wins the middle of the range, Metal pulls ahead at the top by a margin that is not large, and below roughly 5,000 non-zeros per row the sequential arm beats both because neither parallel substrate earns its dispatch overhead.
 
+### binary16 weights buy less than the arithmetic suggests
+
+`cargo run --release --features metal --example f16_crossover` — `Device::prepare_f16` stores weights as IEEE binary16 and the kernel widens them on load. Three runs, each arm timed in both orders and averaged over 20 dispatches:
+
+| n | nnz | f32 weights | f16 weights | speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 5M | 0.47–0.57 ms | 0.43–0.49 ms | 1.02–1.17x |
+| 20,000 | 20M | 1.22–1.40 ms | 1.21–1.29 ms | 1.06–1.13x |
+| 50,000 | 20M | 1.51–1.79 ms | 1.63–1.68 ms | 1.02–1.06x |
+
+This table used to predict "a straight 2x". That was wrong twice over.
+
+First, the arithmetic. The kernel streams `col_ind` (4 bytes) *and* `values` (4 bytes) per non-zero, so narrowing only the values takes traffic from 8 bytes to 6. The ceiling is 1.33x, not 2x.
+
+Second, even 1.33x is not reached, and the likely reason is the term neither figure counts: `x[col_ind[i]]` is a random gather, its cost is unchanged by narrowing the weights, and it is a large share of the real work. Supporting rather than proving that: the win is largest at n = 10,000, where `x` is 40 KB and gather-friendly, and smallest at n = 50,000, where it is 200 KB.
+
+So binary16 is worth a few percent here, not a doubling. It ships because the derivation it forced — [`tolerance_for_spmv_f16`](src/backend/mod.rs) — is the thing that was actually blocking narrow types, and bf16 can now follow the same route.
+
+---
+
 ### The prefix scan is slower on Metal, and that is the finding
 
 `cargo run --release --features metal --example scan_crossover` — same host, milliseconds for a full prefix scan over affine maps.
@@ -377,7 +397,7 @@ Recorded rather than implied. Everything the crate *contains* is wired, tested a
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
-| **f16 / bf16 / bitpacked spikes** | SpMV is bandwidth-bound, so f16 is a straight 2x. A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. |
+| **bf16 / bitpacked spikes** | A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. f16 has now been done that way — see [binary16 weights](#binary16-weights-buy-less-than-the-arithmetic-suggests) — and bf16 would follow the same route. |
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
 
 ---
