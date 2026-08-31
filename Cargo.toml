@@ -24,7 +24,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = []
 # Native Metal compute on Apple silicon. Verified end-to-end against the CPU
 # reference; see `Backend::Metal` and `tests/differential.rs`.
-metal = ["dep:metal", "dep:objc"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
 # Declares intent to build the CUDA backend. It does NOT make CUDA available:
 # no dispatch is implemented, so `Backend::Cuda` stays unconstructible and says
 # so. See `src/backend/cuda.rs` for why this is a feature and not a silent CPU
@@ -37,18 +37,30 @@ rand_chacha = "0.3"
 rayon = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Pinned at 0.29 deliberately. Every release of `metal` in the gfx-rs line,
-# 0.33 included, pulls `block 0.1.6`, which is unmaintained and triggers the
-# `static of uninhabited type` future-incompatibility lint — it will be a hard
-# error in a future Rust. Bumping does not fix that (verified against 0.33), so
-# the version churn would buy nothing.
+# `objc2-metal`, not the gfx-rs `metal` crate. That line pulls `block 0.1.6` at
+# every version including 0.33 (verified), which is unmaintained and trips the
+# `static of uninhabited type` future-incompatibility lint — a hard error in a
+# future Rust. objc2 has no such dependency, and the sibling `tessl` crate was
+# already on it, so the two now share one binding stack.
 #
-# The real fix is migrating this backend to `objc2-metal`, which the sibling
-# `tessl` crate already uses and which has no `block` dependency. That is a
-# rewrite of `src/backend/metal.rs`, not a version bump, and it is tracked as
-# its own change rather than smuggled into an unrelated one.
-metal = { version = "0.29", optional = true }
-objc = { version = "0.2", optional = true }
+# Features are listed rather than defaulted: each Metal class is its own
+# feature, and naming them keeps the build honest about which parts of the API
+# this backend actually touches.
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSError"] }
+objc2-metal = { version = "0.3", optional = true, features = [
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
 
 [dev-dependencies]
 proptest = "1"

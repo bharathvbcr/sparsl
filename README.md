@@ -346,14 +346,13 @@ Re-verification after the fixes: every former survivor is now caught.
 
 ## 🧭 Known gaps
 
-Recorded rather than implied. Everything the crate *contains* is wired, tested and documented; these are capabilities it does not have yet. **SpMM shipped** — see [The batched product](#the-batched-product).
+Recorded rather than implied. Everything the crate *contains* is wired, tested and documented; these are capabilities it does not have yet. **SpMM shipped** — see [The batched product](#the-batched-product). The **`block 0.1.6`** entry is gone too: the Metal backend now uses `objc2-metal`, which does not depend on it, so the future-incompatibility lint that would have become a hard error no longer applies.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **GPU scan** | `assoc_scan` is one of the crate's two headline primitives and is rayon-only. | The chunked scan's bit-identity guarantee rests on a sequential left-fold at chunk boundaries; reproducing that exactly on a GPU is a design question, not a port. |
 | **f16 / bf16 / bitpacked spikes** | SpMV is bandwidth-bound, so f16 is a straight 2x. A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. |
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
-| **`block 0.1.6`** | Arrives via `metal 0.29`, is unmaintained, and trips a future-incompatibility lint that will become a hard error. | Bumping does not fix it — 0.33 pulls the same crate (verified). The real fix is migrating this backend to `objc2-metal`, which `tessl` already uses; that is a rewrite of `src/backend/metal.rs`, tracked separately. |
 
 ---
 

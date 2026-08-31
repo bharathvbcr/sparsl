@@ -3,8 +3,8 @@
 //! `tolerance_for_elementwise` is not a guess at how far apart two substrates
 //! might drift; it is sized for one specific, identified cause. Metal contracts
 //! `v * decay + current` into a single `fma`, rounding once where the CPU
-//! rounds twice. `CompileOptions::set_fast_math_enabled(false)` does not
-//! prevent it, and the property is deprecated in recent Metal anyway.
+//! rounds twice. Asking for conservative semantics does not prevent it: the
+//! backend sets `MTLMathMode::Safe`, and contraction happens anyway.
 //!
 //! This test proves the cause is that and nothing else: every non-spiking GPU
 //! membrane must match one of the two roundings *bit for bit*. A single value

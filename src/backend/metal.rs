@@ -18,19 +18,40 @@
 //!
 //! # Thread safety
 //!
-//! metal-rs marks its handles `Send + Sync`, so a [`crate::SparseOp`] can be
-//! shared across threads. The scratch buffers cannot be: two threads writing
-//! the same host-visible allocation is a data race regardless of what Metal
-//! guarantees about command queues. All scratch lives behind a [`Mutex`], which
-//! serialises dispatch per operator. Parallelism across *operators* is
-//! unaffected.
+//! objc2's `Retained<ProtocolObject<…>>` is deliberately neither `Send` nor
+//! `Sync`: Objective-C object thread-safety is per-class, so the bindings
+//! cannot assume it. metal-rs asserted it blanket-wide. The assertion lives
+//! here instead, narrowed to the two types that need it and justified against
+//! what Apple actually documents — see the `unsafe impl`s below.
+//!
+//! Given that, a [`crate::SparseOp`] can be shared across threads. The scratch
+//! buffers cannot be: two threads writing the same host-visible allocation is a
+//! data race regardless of what Metal guarantees about command queues. All
+//! scratch lives behind a [`Mutex`], which serialises dispatch per operator.
+//! Parallelism across *operators* is unaffected.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use metal::{
-    Buffer, CommandQueue, ComputePipelineState, Device as MtlDevice, MTLResourceOptions, MTLSize,
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
 };
+
+// Aliases so the structs and signatures below read the same as they did under
+// the gfx-rs `metal` crate. objc2 spells every Metal type as a `Retained`
+// protocol object; naming them once keeps that at the boundary instead of
+// spread through every field and argument.
+type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+type MtlDevice = Retained<ProtocolObject<dyn MTLDevice>>;
+/// Borrowed encoder, for the `set_*` helpers at the bottom of this file.
+type ComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 
 use super::{LifParams, OpError, SparsePlanError, SparseShape};
 use crate::sparse::{Csc, Csr};
@@ -39,11 +60,11 @@ const KERNEL_SOURCE: &str = include_str!("../kernels/spmv.metal");
 
 /// Threads per threadgroup for the one-thread-per-row kernels, capped by the
 /// pipeline's own limit.
-const PREFERRED_THREADGROUP: u64 = 256;
+const PREFERRED_THREADGROUP: usize = 256;
 
 /// SIMD-group width on Apple silicon. The fused kernel hard-codes this in its
 /// strided load and its `simd_sum`, so it is a contract, not a tunable.
-const SIMD_WIDTH: u64 = 32;
+const SIMD_WIDTH: usize = 32;
 
 /// Trailing sentinel elements appended to every writable scratch buffer.
 ///
@@ -107,38 +128,76 @@ pub struct MetalDevice {
     fused: ComputePipelineState,
 }
 
+// SAFETY: every field is a Metal object Apple documents as safe to use from
+// multiple threads — `MTLDevice`, `MTLCommandQueue` and `MTLComputePipelineState`
+// are all thread-safe, and the pipelines and queue are built once in
+// `open_uncached` and never mutated afterwards. The struct is reached only
+// through an `Arc` handed out by `shared()`, so there is no interior mutation
+// to race on either.
+//
+// This is the narrow form of what metal-rs asserted for its whole type set.
+unsafe impl Send for MetalDevice {}
+unsafe impl Sync for MetalDevice {}
+
+// SAFETY: three classes of field, each safe for a different reason.
+//
+// `device` is the `Arc<MetalDevice>` justified directly above. The resident
+// buffers — `row_ptr`, `col`, `values` and `transpose` — are written once at
+// `prepare`, or through `set_weights`, which takes `&mut self` and so cannot
+// run while any `&self` method does. Everything a kernel writes lives in
+// `scratch`, behind a `Mutex`, so two threads dispatching the same operator
+// serialise on it rather than sharing a host-visible allocation.
+//
+// Concurrent *encoding* from separate operators onto the one shared queue is
+// what `MTLCommandQueue`'s documented thread-safety covers. `tests/stress.rs`
+// exercises the case this exists for: `THREADS` workers calling `spmv` on one
+// `Arc<SparseOp>` and asserting each gets bit-identical results.
+unsafe impl Send for MetalSparse {}
+unsafe impl Sync for MetalSparse {}
+
 impl MetalDevice {
     fn open_uncached() -> Result<Self, &'static str> {
-        let device = MtlDevice::system_default().ok_or("no Metal device on this system")?;
-        let queue = device.new_command_queue();
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device on this system")?;
+        let queue = device
+            .newCommandQueue()
+            .ok_or("Metal device returned no command queue")?;
 
-        let options = metal::CompileOptions::new();
+        let options = MTLCompileOptions::new();
         // Requests conservative float semantics: no reciprocal approximation,
         // no reassociation.
         //
-        // It does NOT stop the compiler contracting `a * b + c` into a single
-        // `fma`, and that is measured rather than assumed —
+        // `mathMode`, not the deprecated `fastMathEnabled`. metal-rs 0.29 did
+        // not expose it, which is why this used to set the older property; a
+        // comment here recorded that as a known compromise. objc2-metal does
+        // expose it, so the compromise is gone.
+        //
+        // The swap was measured, not assumed equivalent: an FNV hash over the
+        // bits of a 512-row SpMV plus eight fused LIF steps is
+        // 0x927D9E2BD2C836B2 under both settings on this host. That is one
+        // machine and one Metal version — it says the two are the same choice
+        // here, not that they must agree everywhere.
+        //
+        // Neither setting stops the compiler contracting `a * b + c` into a
+        // single `fma`, and that too is measured rather than assumed —
         // `tests/fma_contraction.rs` compares every non-spiking GPU membrane
-        // against both roundings and finds the fused one used. `fast_math` is
-        // also deprecated in recent Metal in favour of `mathMode`, which
-        // metal-rs 0.29 does not expose.
+        // against both roundings and finds the fused one used.
         //
         // The consequence is a real one, not a curiosity: one rounding instead
         // of two shifts the membrane by up to an ulp, and that value is then
         // compared against a threshold — so contraction can flip a spike, not
         // merely perturb a float. Cross-backend comparisons must budget for it;
         // see `tolerance_for_elementwise`.
-        options.set_fast_math_enabled(false);
+        options.setMathMode(MTLMathMode::Safe);
         let library = device
-            .new_library_with_source(KERNEL_SOURCE, &options)
+            .newLibraryWithSource_options_error(&NSString::from_str(KERNEL_SOURCE), Some(&options))
             .map_err(|e| leak(format!("sparsl MSL failed to compile: {e}")))?;
 
         let pipeline = |name: &str| -> Result<ComputePipelineState, &'static str> {
             let function = library
-                .get_function(name, None)
-                .map_err(|e| leak(format!("kernel `{name}` not found in library: {e}")))?;
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| leak(format!("kernel `{name}` not found in library")))?;
             device
-                .new_compute_pipeline_state_with_function(&function)
+                .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|e| leak(format!("pipeline for `{name}` failed to build: {e}")))
         };
 
@@ -169,7 +228,7 @@ impl MetalDevice {
             ("lif_integrate_kernel", &lif),
             ("fused_spmv_lif_simdgroup_kernel", &fused),
         ] {
-            let width = pipeline.thread_execution_width();
+            let width = pipeline.threadExecutionWidth();
             if width != SIMD_WIDTH {
                 return Err(leak(format!(
                     "`{name}` reports a SIMD execution width of {width}, but sparsl's \
@@ -195,13 +254,13 @@ impl MetalDevice {
         self.device.name().to_string()
     }
 
-    fn threadgroup_for(&self, pipeline: &ComputePipelineState) -> u64 {
-        PREFERRED_THREADGROUP.min(pipeline.max_total_threads_per_threadgroup())
+    fn threadgroup_for(&self, pipeline: &ComputePipelineState) -> usize {
+        PREFERRED_THREADGROUP.min(pipeline.maxTotalThreadsPerThreadgroup())
     }
 
     /// Threadgroup size for the fused kernel: a multiple of the SIMD width, so
     /// `threads_per_threadgroup / 32` is the exact number of rows per group.
-    fn fused_threadgroup(&self) -> u64 {
+    fn fused_threadgroup(&self) -> usize {
         let cap = self.threadgroup_for(&self.fused);
         // Round down to a whole number of SIMD groups, then clamp: the `.max(1)`
         // alone would round a sub-32 cap *up* to 32 and dispatch a threadgroup
@@ -215,10 +274,11 @@ impl MetalDevice {
     /// one-element placeholder. Nothing reads it: every kernel is bounded by an
     /// explicit count, and the dispatch is skipped entirely when the count is 0.
     fn alloc<T>(&self, len: usize, what: &'static str) -> Result<Buffer, SparsePlanError> {
-        let bytes = (len.max(1) * std::mem::size_of::<T>()) as u64;
+        let bytes = len.max(1) * std::mem::size_of::<T>();
         let buffer = self
             .device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(SparsePlanError::Allocation { what })?;
         if buffer.length() < bytes {
             return Err(SparsePlanError::Allocation { what });
         }
@@ -233,10 +293,11 @@ impl MetalDevice {
     ) -> Result<Guarded, SparsePlanError> {
         let elem = std::mem::size_of::<T>();
         let total = len + CANARY_ELEMS;
-        let bytes = (total * elem) as u64;
+        let bytes = total * elem;
         let buffer = self
             .device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(SparsePlanError::Allocation { what })?;
         if buffer.length() < bytes {
             return Err(SparsePlanError::Allocation { what });
         }
@@ -254,12 +315,19 @@ impl MetalDevice {
         if data.is_empty() {
             return self.alloc::<T>(0, what);
         }
-        let bytes = std::mem::size_of_val(data) as u64;
-        let buffer = self.device.new_buffer_with_data(
-            data.as_ptr() as *const c_void,
-            bytes,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let bytes = std::mem::size_of_val(data);
+        // SAFETY: `data` is a live borrow of at least `bytes` initialised
+        // bytes, which is exactly what `newBufferWithBytes` copies from. The
+        // copy happens during the call, so the pointer does not outlive it.
+        let buffer = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(data.as_ptr() as *mut c_void)
+                    .ok_or(SparsePlanError::Allocation { what })?,
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or(SparsePlanError::Allocation { what })?;
         if buffer.length() < bytes {
             return Err(SparsePlanError::Allocation { what });
         }
@@ -346,21 +414,26 @@ impl MetalDevice {
         let spikes_buf = self.alloc::<u8>(n, "spikes").expect("spikes alloc");
 
         let tg = self.threadgroup_for(&self.lif);
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.lif);
-        enc.set_buffer(0, Some(&v_buf), 0);
-        enc.set_buffer(1, Some(&theta_buf), 0);
-        enc.set_buffer(2, Some(&currents_buf), 0);
-        enc.set_buffer(3, Some(&spikes_buf), 0);
-        set_f32(enc, 4, params.decay());
-        set_f32(enc, 5, params.v_reset());
-        set_f32(enc, 6, params.delta_theta());
-        set_u32(enc, 7, n as u32);
-        enc.dispatch_threads(size(n as u64), size(tg));
-        enc.end_encoding();
+        let cb = self
+            .queue
+            .commandBuffer()
+            .expect("Metal returned no command buffer");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("Metal returned no compute encoder");
+        enc.setComputePipelineState(&self.lif);
+        set_buf(&enc, 0, &v_buf);
+        set_buf(&enc, 1, &theta_buf);
+        set_buf(&enc, 2, &currents_buf);
+        set_buf(&enc, 3, &spikes_buf);
+        set_f32(&enc, 4, params.decay());
+        set_f32(&enc, 5, params.v_reset());
+        set_f32(&enc, 6, params.delta_theta());
+        set_u32(&enc, 7, n as u32);
+        enc.dispatchThreads_threadsPerThreadgroup(size(n), size(tg));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         read_into(&v_buf, v);
         read_into(&theta_buf, theta);
@@ -409,7 +482,7 @@ impl Guarded {
         // the allocation by construction in `alloc_guarded`, and the caller
         // holds the scratch mutex.
         unsafe {
-            let base = (self.buffer.contents() as *mut u8).add(self.len_bytes);
+            let base = (self.buffer.contents().as_ptr() as *mut u8).add(self.len_bytes);
             for i in 0..self.canary_bytes {
                 base.add(i).write(pattern[i % 4]);
             }
@@ -421,7 +494,7 @@ impl Guarded {
         let pattern = CANARY_BITS.to_ne_bytes();
         // SAFETY: as `arm`.
         let corrupted = unsafe {
-            let base = (self.buffer.contents() as *const u8).add(self.len_bytes);
+            let base = (self.buffer.contents().as_ptr() as *const u8).add(self.len_bytes);
             (0..self.canary_bytes).any(|i| base.add(i).read() != pattern[i % 4])
         };
         if corrupted {
@@ -507,19 +580,25 @@ impl MetalSparse {
         scratch.y.write(y);
 
         let tg = self.device.threadgroup_for(&self.device.spmv);
-        let cb = self.device.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.device.spmv);
-        enc.set_buffer(0, Some(&self.row_ptr), 0);
-        enc.set_buffer(1, Some(&self.col), 0);
-        enc.set_buffer(2, Some(&self.values), 0);
-        enc.set_buffer(3, Some(&scratch.x), 0);
-        enc.set_buffer(4, Some(&scratch.y.buffer), 0);
-        set_u32(enc, 5, self.shape.nrows as u32);
-        enc.dispatch_threads(size(self.shape.nrows as u64), size(tg));
-        enc.end_encoding();
+        let cb = self
+            .device
+            .queue
+            .commandBuffer()
+            .expect("Metal returned no command buffer");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("Metal returned no compute encoder");
+        enc.setComputePipelineState(&self.device.spmv);
+        set_buf(&enc, 0, &self.row_ptr);
+        set_buf(&enc, 1, &self.col);
+        set_buf(&enc, 2, &self.values);
+        set_buf(&enc, 3, &scratch.x);
+        set_buf(&enc, 4, &scratch.y.buffer);
+        set_u32(&enc, 5, self.shape.nrows as u32);
+        enc.dispatchThreads_threadsPerThreadgroup(size(self.shape.nrows), size(tg));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         scratch.y.assert_intact();
         read_into(&scratch.y.buffer, y);
@@ -584,20 +663,26 @@ impl MetalSparse {
         batch.y.write(&y[..need_y]);
 
         let tg = self.device.threadgroup_for(&self.device.spmm);
-        let cb = self.device.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.device.spmm);
-        enc.set_buffer(0, Some(&self.row_ptr), 0);
-        enc.set_buffer(1, Some(&self.col), 0);
-        enc.set_buffer(2, Some(&self.values), 0);
-        enc.set_buffer(3, Some(&batch.x), 0);
-        enc.set_buffer(4, Some(&batch.y.buffer), 0);
-        set_u32(enc, 5, self.shape.nrows as u32);
-        set_u32(enc, 6, n_vec as u32);
-        enc.dispatch_threads(size(need_y as u64), size(tg));
-        enc.end_encoding();
+        let cb = self
+            .device
+            .queue
+            .commandBuffer()
+            .expect("Metal returned no command buffer");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("Metal returned no compute encoder");
+        enc.setComputePipelineState(&self.device.spmm);
+        set_buf(&enc, 0, &self.row_ptr);
+        set_buf(&enc, 1, &self.col);
+        set_buf(&enc, 2, &self.values);
+        set_buf(&enc, 3, &batch.x);
+        set_buf(&enc, 4, &batch.y.buffer);
+        set_u32(&enc, 5, self.shape.nrows as u32);
+        set_u32(&enc, 6, n_vec as u32);
+        enc.dispatchThreads_threadsPerThreadgroup(size(need_y), size(tg));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         batch.y.assert_intact();
         read_into(&batch.y.buffer, &mut y[..need_y]);
@@ -632,20 +717,26 @@ impl MetalSparse {
         yt.write(y);
 
         let tg = self.device.threadgroup_for(&self.device.spmv_t);
-        let cb = self.device.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.device.spmv_t);
-        enc.set_buffer(0, Some(&idx.col_ptr), 0);
-        enc.set_buffer(1, Some(&idx.row), 0);
-        enc.set_buffer(2, Some(&idx.edge_idx), 0);
-        enc.set_buffer(3, Some(&self.values), 0);
-        enc.set_buffer(4, Some(xt), 0);
-        enc.set_buffer(5, Some(&yt.buffer), 0);
-        set_u32(enc, 6, self.shape.ncols as u32);
-        enc.dispatch_threads(size(self.shape.ncols as u64), size(tg));
-        enc.end_encoding();
+        let cb = self
+            .device
+            .queue
+            .commandBuffer()
+            .expect("Metal returned no command buffer");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("Metal returned no compute encoder");
+        enc.setComputePipelineState(&self.device.spmv_t);
+        set_buf(&enc, 0, &idx.col_ptr);
+        set_buf(&enc, 1, &idx.row);
+        set_buf(&enc, 2, &idx.edge_idx);
+        set_buf(&enc, 3, &self.values);
+        set_buf(&enc, 4, xt);
+        set_buf(&enc, 5, &yt.buffer);
+        set_u32(&enc, 6, self.shape.ncols as u32);
+        enc.dispatchThreads_threadsPerThreadgroup(size(self.shape.ncols), size(tg));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         yt.assert_intact();
         read_into(&yt.buffer, y);
@@ -672,26 +763,32 @@ impl MetalSparse {
         // the tail group and silently shift every row index in it.
         let tg = self.device.fused_threadgroup();
         let rows_per_group = (tg / SIMD_WIDTH).max(1);
-        let groups = (self.shape.nrows as u64).div_ceil(rows_per_group);
+        let groups = self.shape.nrows.div_ceil(rows_per_group);
 
-        let cb = self.device.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.device.fused);
-        enc.set_buffer(0, Some(&self.row_ptr), 0);
-        enc.set_buffer(1, Some(&self.col), 0);
-        enc.set_buffer(2, Some(&self.values), 0);
-        enc.set_buffer(3, Some(&scratch.x), 0);
-        enc.set_buffer(4, Some(&scratch.v.buffer), 0);
-        enc.set_buffer(5, Some(&scratch.theta.buffer), 0);
-        enc.set_buffer(6, Some(&scratch.spikes.buffer), 0);
-        set_f32(enc, 7, params.decay());
-        set_f32(enc, 8, params.v_reset());
-        set_f32(enc, 9, params.delta_theta());
-        set_u32(enc, 10, self.shape.nrows as u32);
-        enc.dispatch_thread_groups(size(groups), size(tg));
-        enc.end_encoding();
+        let cb = self
+            .device
+            .queue
+            .commandBuffer()
+            .expect("Metal returned no command buffer");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("Metal returned no compute encoder");
+        enc.setComputePipelineState(&self.device.fused);
+        set_buf(&enc, 0, &self.row_ptr);
+        set_buf(&enc, 1, &self.col);
+        set_buf(&enc, 2, &self.values);
+        set_buf(&enc, 3, &scratch.x);
+        set_buf(&enc, 4, &scratch.v.buffer);
+        set_buf(&enc, 5, &scratch.theta.buffer);
+        set_buf(&enc, 6, &scratch.spikes.buffer);
+        set_f32(&enc, 7, params.decay());
+        set_f32(&enc, 8, params.v_reset());
+        set_f32(&enc, 9, params.delta_theta());
+        set_u32(&enc, 10, self.shape.nrows as u32);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(tg));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         scratch.v.assert_intact();
         scratch.theta.assert_intact();
@@ -717,7 +814,7 @@ impl MetalSparse {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-fn size(width: u64) -> MTLSize {
+fn size(width: usize) -> MTLSize {
     MTLSize {
         width,
         height: 1,
@@ -725,20 +822,42 @@ fn size(width: u64) -> MTLSize {
     }
 }
 
-fn set_f32(enc: &metal::ComputeCommandEncoderRef, index: u64, value: f32) {
-    enc.set_bytes(
-        index,
-        std::mem::size_of::<f32>() as u64,
-        &value as *const f32 as *const c_void,
-    );
+/// Bind a scalar by value into the encoder's constant space.
+///
+/// # Safety
+///
+/// `value` must live until the call returns; `setBytes` copies it, so a
+/// borrow of a local is enough. `index` must name a buffer slot the bound
+/// pipeline declares — every caller passes the literal index from the kernel
+/// signature it is dispatching.
+fn set_scalar<T: Copy>(enc: &ComputeEncoder, index: usize, value: T) {
+    // SAFETY: `&value` is a live borrow of exactly `size_of::<T>()` initialised
+    // bytes for the duration of the call, and Metal copies out of it before
+    // returning. The pointer is non-null because it comes from a reference.
+    unsafe {
+        enc.setBytes_length_atIndex(
+            std::ptr::NonNull::new(&value as *const T as *mut c_void)
+                .expect("a reference is never null"),
+            std::mem::size_of::<T>(),
+            index,
+        );
+    }
 }
 
-fn set_u32(enc: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
-    enc.set_bytes(
-        index,
-        std::mem::size_of::<u32>() as u64,
-        &value as *const u32 as *const c_void,
-    );
+fn set_f32(enc: &ComputeEncoder, index: usize, value: f32) {
+    set_scalar(enc, index, value);
+}
+
+fn set_u32(enc: &ComputeEncoder, index: usize, value: u32) {
+    set_scalar(enc, index, value);
+}
+
+/// Bind a buffer at `index`, offset zero.
+fn set_buf(enc: &ComputeEncoder, index: usize, buffer: &Buffer) {
+    // SAFETY: `buffer` outlives the encoder — every one is owned by the
+    // `MetalSparse` or the `Scratch` held under its mutex for the whole
+    // dispatch — and `index` is the literal slot from the kernel signature.
+    unsafe { enc.setBuffer_offset_atIndex(Some(buffer), 0, index) };
 }
 
 /// Copy `src` into the head of a shared buffer.
@@ -753,7 +872,7 @@ fn write_from<T: Copy>(buffer: &Buffer, src: &[T]) {
     if src.is_empty() {
         return;
     }
-    let bytes = std::mem::size_of_val(src) as u64;
+    let bytes = std::mem::size_of_val(src);
     assert!(
         buffer.length() >= bytes,
         "sparsl: scratch buffer holds {} bytes, tried to write {bytes}",
@@ -772,7 +891,11 @@ fn write_from<T: Copy>(buffer: &Buffer, src: &[T]) {
     //   - `MetalDevice::lif_integrate` writes only buffers it allocated inside
     //     the same call, which no other thread can name.
     unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), buffer.contents() as *mut T, src.len());
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            buffer.contents().as_ptr() as *mut T,
+            src.len(),
+        );
     }
 }
 
@@ -784,7 +907,7 @@ fn read_buffer_into<T: Copy>(buffer: &Buffer, dst: &mut [T]) {
     if dst.is_empty() {
         return;
     }
-    let bytes = std::mem::size_of_val(dst) as u64;
+    let bytes = std::mem::size_of_val(dst);
     assert!(
         buffer.length() >= bytes,
         "sparsl: scratch buffer holds {} bytes, tried to read {bytes}",
@@ -793,7 +916,11 @@ fn read_buffer_into<T: Copy>(buffer: &Buffer, dst: &mut [T]) {
     // SAFETY: as `write_from`, in the opposite direction. The dispatch that
     // produced these bytes was waited on before this call.
     unsafe {
-        std::ptr::copy_nonoverlapping(buffer.contents() as *const T, dst.as_mut_ptr(), dst.len());
+        std::ptr::copy_nonoverlapping(
+            buffer.contents().as_ptr() as *const T,
+            dst.as_mut_ptr(),
+            dst.len(),
+        );
     }
 }
 

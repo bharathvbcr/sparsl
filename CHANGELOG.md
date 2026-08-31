@@ -6,6 +6,26 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The Metal backend now uses `objc2-metal` instead of the gfx-rs `metal`
+  crate.** That removes `block 0.1.6` and `objc 0.2` from the tree entirely.
+  `block` is unmaintained and triggers the `static of uninhabited type`
+  future-incompatibility lint, which becomes a hard error in a future Rust;
+  bumping `metal` did not help, because every release in that line including
+  0.33 pulls the same crate. `tessl` was already on objc2, so the two crates
+  now share one binding stack.
+- Thread-safety is now asserted narrowly rather than inherited. metal-rs marked
+  its handles `Send + Sync` blanket-wide; objc2's `Retained` is deliberately
+  neither, because Objective-C thread-safety is per-class. `MetalDevice` and
+  `MetalSparse` carry `unsafe impl`s justified against what Apple documents,
+  and `tests/stress.rs` exercises the case they exist for.
+- `MTLMathMode::Safe` replaces the deprecated `setFastMathEnabled(false)`. A
+  comment in the old code recorded that metal-rs 0.29 could not express this;
+  objc2-metal can. Verified equivalent rather than assumed: an FNV hash over
+  the bits of a 512-row SpMV plus eight fused LIF steps is identical under both
+  settings on this host.
+
 ### Added
 
 - **`SparseOp::spmm` — batched sparse matrix times dense matrix**, `Y += A·X`
