@@ -1,0 +1,38 @@
+[package]
+name = "sparsl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Deterministic sparse + scan compute kernels for event-driven simulation, with fail-closed CPU/GPU backends"
+repository = "https://github.com/bharathvbcr/sparsl"
+readme = "README.md"
+keywords = ["sparse", "spmv", "simd", "metal", "deterministic"]
+categories = ["science", "algorithms", "hardware-support"]
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+# Native Metal compute on Apple silicon. Verified end-to-end against the CPU
+# reference; see `Backend::Metal` and `tests/differential.rs`.
+metal = ["dep:metal", "dep:objc"]
+# Declares intent to build the CUDA backend. It does NOT make CUDA available:
+# no dispatch is implemented, so `Backend::Cuda` stays unconstructible and says
+# so. See `src/backend/cuda.rs` for why this is a feature and not a silent CPU
+# fallback.
+cuda = []
+
+[dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
+rayon = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29", optional = true }
+objc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[[example]]
+name = "crossover"
+required-features = ["metal"]

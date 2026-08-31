@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# Provenance: this seed was recorded during the mutation campaign, not by a
+# defect in shipped code — an injected fault made the differential test fail and
+# proptest shrank it to this case. It is kept because what it shrank to is worth
+# running every time regardless of how it was found: a 1x1 operator with no
+# edges, which exercises the zero-nnz allocation and empty-dispatch paths.
+cc ebbfaacbdc37f6503b88180f2e1b1af673a63aa4a6c6955b2f06692340afbed7 # shrinks to nrows = 1, ncols = 1, max_deg = 0, seed = 0
