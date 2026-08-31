@@ -11,6 +11,8 @@ pub enum CsrError {
     NotMonotonic { index: usize },
     /// `row_ptr[last]` must equal `col.len()`.
     NnzMismatch { row_ptr_end: u32, col_len: usize },
+    /// A stored column index is at or past the declared column count.
+    ColumnOutOfRange { col: u32, ncols: usize },
 }
 
 impl core::fmt::Display for CsrError {
@@ -22,6 +24,9 @@ impl core::fmt::Display for CsrError {
             }
             Self::NotMonotonic { index } => {
                 write!(f, "CSR row_ptr not monotonic at index {index}")
+            }
+            Self::ColumnOutOfRange { col, ncols } => {
+                write!(f, "CSR column {col} is out of range for ncols={ncols}")
             }
             Self::NnzMismatch {
                 row_ptr_end,
@@ -140,10 +145,27 @@ impl Csr {
         })
     }
 
-    /// Build a CSC reverse index over this CSR (square cell graph: `ncols = nrows`).
+    /// Build a CSC reverse index over this CSR, assuming a **square** graph
+    /// (`ncols == nrows`), which is what a recurrent cell graph is.
+    ///
+    /// Panics if any stored column is at or past `nrows`. For a rectangular
+    /// operator — anything where the input and output dimensions differ — use
+    /// [`Csr::to_csc_rect`], which takes the column count and returns an error
+    /// instead.
     #[inline]
     pub fn to_csc(&self) -> Csc {
         Csc::from_csr(self)
+    }
+
+    /// Build a CSC reverse index over this CSR with an explicit column count.
+    ///
+    /// The general form of [`Csr::to_csc`]. A sparse layer whose input and
+    /// output widths differ has no square assumption to fall back on, and the
+    /// column count cannot be recovered from the CSR: `col` records which
+    /// columns are *used*, not how many exist.
+    #[inline]
+    pub fn to_csc_rect(&self, ncols: usize) -> Result<Csc, CsrError> {
+        Csc::from_csr_rect(self, ncols)
     }
 }
 
@@ -172,23 +194,45 @@ impl Csc {
         }
     }
 
-    /// Build CSC fan-in from a CSR graph.
+    /// Build CSC fan-in from a **square** CSR graph (`ncols = csr.nrows()`).
     ///
-    /// Uses `ncols = csr.nrows()` (directed cell graph). Column indices in
-    /// `csr.col` must be `< ncols`.
+    /// # Panics
+    ///
+    /// If any stored column is at or past `csr.nrows()`. That is a caller
+    /// error — this constructor's whole premise is that the graph is square —
+    /// but it is a panic only because it predates a rectangular caller. For
+    /// anything that is not a recurrent cell graph, call
+    /// [`Csc::from_csr_rect`], which takes the column count and returns
+    /// [`CsrError::ColumnOutOfRange`].
     pub fn from_csr(csr: &Csr) -> Self {
-        let ncols = csr.nrows();
+        Self::from_csr_rect(csr, csr.nrows()).unwrap_or_else(|e| {
+            panic!("CSC build over a square graph: {e}");
+        })
+    }
+
+    /// Build CSC fan-in from a CSR with an explicit column count.
+    ///
+    /// The general form. `ncols` is the declared width of the operator, which
+    /// is not recoverable from the CSR — `col` records which columns are used,
+    /// not how many exist, so a matrix whose last columns are all empty is
+    /// indistinguishable from a narrower one.
+    pub fn from_csr_rect(csr: &Csr, ncols: usize) -> Result<Self, CsrError> {
         if ncols == 0 {
-            return Self::empty(0);
+            // An operator with no columns can still have rows; it just has
+            // nowhere to store an edge. A non-empty `col` here means the CSR
+            // and the declared width disagree.
+            return match csr.col.first() {
+                Some(&col) => Err(CsrError::ColumnOutOfRange { col, ncols }),
+                None => Ok(Self::empty(0)),
+            };
         }
         let nnz = csr.nnz();
         let mut degrees = vec![0u32; ncols];
         for &c in &csr.col {
             let col = c as usize;
-            assert!(
-                col < ncols,
-                "CSC build: column {c} out of range (ncols={ncols})"
-            );
+            if col >= ncols {
+                return Err(CsrError::ColumnOutOfRange { col: c, ncols });
+            }
             degrees[col] += 1;
         }
 
@@ -215,11 +259,11 @@ impl Csc {
             }
         }
 
-        Self {
+        Ok(Self {
             col_ptr,
             row,
             edge_idx,
-        }
+        })
     }
 
     /// Number of columns (postsynaptic cells).

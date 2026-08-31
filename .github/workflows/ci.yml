@@ -61,6 +61,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Docs build clean (linux, no metal feature)
+        # Three public doc comments linked private items; one named
+        # `SparseOp::prepare`, which exists but is crate-private — the public
+        # entry point is `Device::prepare`. `-D warnings` keeps that at zero.
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # ---------------------------------------------------------------------------
   # Metal, tested for real on a hosted runner.
@@ -90,6 +97,14 @@ jobs:
       - name: Report which device this runner has
         run: cargo run --release --features metal --example readme
       - run: cargo clippy --features metal --all-targets -- -D warnings
+      - name: Docs build clean (with the metal feature)
+        # `[package.metadata.docs.rs]` renders this crate for
+        # aarch64-apple-darwin with `metal` on, so that configuration is the one
+        # readers see. It is only checkable on a macOS runner.
+        run: cargo doc --no-deps --features metal
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Full suite with Metal
         run: cargo test --features metal --release --all-targets
 

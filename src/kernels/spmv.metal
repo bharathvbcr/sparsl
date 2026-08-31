@@ -108,3 +108,36 @@ kernel void fused_spmv_lif_simdgroup_kernel(
         }
     }
 }
+
+/// y += A^T * x, one thread per output column.
+///
+/// Walks the CSC reverse index rather than transposing the matrix: for output
+/// column `c`, every stored entry `k` in `[col_ptr[c], col_ptr[c+1])` names the
+/// CSR row it came from (`row[k]`) and the slot its value occupies in the
+/// forward `values` array (`edge_idx[k]`). One value table serves both
+/// directions, so a weight update is visible to both without a second upload.
+///
+/// `row[k]` and `edge_idx[k]` are unchecked here for the same reason `col_ind`
+/// is above: `Csc::from_csr` derives them from a CSR that `SparseOp::prepare`
+/// has already validated, so `row[k] < n_rows` and `edge_idx[k] < nnz` hold by
+/// construction. An unvalidated CSC reaching this kernel would read arbitrary
+/// device memory.
+kernel void csc_spmv_t_kernel(
+    device const uint*  col_ptr  [[buffer(0)]],
+    device const uint*  row_ind  [[buffer(1)]],
+    device const uint*  edge_idx [[buffer(2)]],
+    device const float* values   [[buffer(3)]],
+    device const float* x        [[buffer(4)]],
+    device float*       y        [[buffer(5)]],
+    constant uint&      n_cols   [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= n_cols) { return; }
+    uint col_start = col_ptr[id];
+    uint col_end   = col_ptr[id + 1];
+    float sum = 0.0f;
+    for (uint k = col_start; k < col_end; ++k) {
+        sum += values[edge_idx[k]] * x[row_ind[k]];
+    }
+    y[id] += sum;
+}

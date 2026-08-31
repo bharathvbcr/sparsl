@@ -19,13 +19,14 @@
 //!
 //! GPU kernels index `x[col[i]]` with no range check — a bounds check per
 //! non-zero would cost more than the multiply. That is only safe because
-//! [`SparseOp::prepare`] validates every stored column index against `ncols`
-//! *before* anything is uploaded, and a `SparseOp` is the only way to reach a
-//! sparse kernel. An unvalidated [`Csr`] cannot reach device code.
+//! [`Device::prepare`] validates every stored column index against `ncols`
+//! *before* anything is uploaded, and the [`SparseOp`] it returns is the only
+//! way to reach a sparse kernel. An unvalidated [`Csr`] cannot reach device
+//! code.
 
 use core::fmt;
 
-use crate::sparse::Csr;
+use crate::sparse::{Csc, Csr};
 
 // Crate-private on purpose. `MetalDevice::prepare` takes a `SparseShape` and
 // performs no validation of its own — it trusts that the shape came from
@@ -314,6 +315,8 @@ pub enum OpError {
         min: usize,
         got: usize,
     },
+    /// [`SparseOp::spmv_t`] on an operator built without a reverse index.
+    TransposeNotPrepared,
 }
 
 impl fmt::Display for OpError {
@@ -324,6 +327,11 @@ impl fmt::Display for OpError {
                 expected,
                 got,
             } => write!(f, "`{what}` must have length {expected}, got {got}"),
+            Self::TransposeNotPrepared => write!(
+                f,
+                "this operator has no reverse index; build it with \
+                 `Device::prepare_with_transpose` to use `spmv_t`"
+            ),
             Self::TooShort { what, min, got } => {
                 write!(f, "`{what}` must have length >= {min}, got {got}")
             }
@@ -360,7 +368,8 @@ fn require_min_len(what: &'static str, got: usize, min: usize) -> Result<(), OpE
 /// Validated dimensions of a prepared sparse operator.
 ///
 /// The fields are private and there is no public constructor, so a value of
-/// this type can only have come from [`validate_csr`]. That is deliberate and
+/// this type can only have come from the crate-private `validate_csr`. That is
+/// deliberate and
 /// load-bearing rather than mere encapsulation: the GPU kernels index
 /// `x[col[i]]` with no bounds check, and a `SparseShape` is the token that says
 /// the indices were checked. If a caller could build one, the token would mean
@@ -656,7 +665,26 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(self.clone(), csr, ncols, weights)
+        SparseOp::prepare(self.clone(), csr, ncols, weights, false)
+    }
+
+    /// [`Device::prepare`], plus the reverse index [`SparseOp::spmv_t`] needs.
+    ///
+    /// Costs a second index of the same size as the forward one — `nnz` row
+    /// indices and `nnz` edge indices, plus `ncols + 1` column pointers. That
+    /// is why it is a separate entry point rather than always-on: a
+    /// forward-only caller should not pay for a gradient path it never walks.
+    ///
+    /// The reverse index is derived from the same validated CSR and points at
+    /// the same weight table, so the two directions cannot disagree about
+    /// either structure or values.
+    pub fn prepare_with_transpose(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+    ) -> Result<SparseOp, SparsePlanError> {
+        SparseOp::prepare(self.clone(), csr, ncols, weights, true)
     }
 
     /// LIF membrane integrate over dense per-cell state.
@@ -704,6 +732,11 @@ enum OpResident {
     Cpu {
         csr: Csr,
         weights: Vec<f32>,
+        /// Present only when the operator was built by
+        /// [`Device::prepare_with_transpose`]. Building it always would double
+        /// the index memory of every forward-only caller, which is most of
+        /// them.
+        csc: Option<Csc>,
     },
     #[cfg(all(target_os = "macos", feature = "metal"))]
     Metal(metal::MetalSparse),
@@ -734,6 +767,7 @@ impl SparseOp {
         csr: &Csr,
         ncols: usize,
         weights: &[f32],
+        transpose: bool,
     ) -> Result<Self, SparsePlanError> {
         let shape = validate_csr(csr, ncols)?;
         if weights.len() != shape.nnz {
@@ -742,13 +776,42 @@ impl SparseOp {
                 got: weights.len(),
             });
         }
+        // Derived from the CSR that `validate_csr` just accepted, so every
+        // `row` is a valid CSR row and every `edge_idx` a valid weight slot.
+        // That is what makes the unchecked indexing in `col_dot` and
+        // `csc_spmv_t_kernel` sound, exactly as for the forward direction.
+        // `to_csc_rect`, not `to_csc`: the latter assumes a square graph and
+        // panics on a rectangular one. `validate_csr` has already proven every
+        // column is below `ncols`, so this cannot fail — but it is checked
+        // rather than unwrapped, because the alternative is a panic reaching a
+        // caller who passed a perfectly ordinary non-square operator.
+        let csc = match transpose {
+            true => Some(csr.to_csc_rect(ncols).map_err(|_| {
+                // Unreachable: `validate_csr` above proved every stored column
+                // is below `ncols`, so the only error this constructor raises
+                // cannot fire. Mapped rather than unwrapped so that a future
+                // divergence between the two checks surfaces as the error the
+                // caller already handles, not as a panic from inside `prepare`.
+                let (edge, col) = csr
+                    .col
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| **c as usize >= ncols)
+                    .map_or((0, 0), |(i, c)| (i, *c));
+                SparsePlanError::ColumnOutOfRange { edge, col, ncols }
+            })?),
+            false => None,
+        };
         let resident = match &device.inner {
             DeviceInner::Cpu => OpResident::Cpu {
                 csr: csr.clone(),
                 weights: weights.to_vec(),
+                csc,
             },
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            DeviceInner::Metal(d) => OpResident::Metal(d.prepare(csr, shape, weights)?),
+            DeviceInner::Metal(d) => {
+                OpResident::Metal(d.prepare(csr, shape, weights, csc.as_ref())?)
+            }
         };
         Ok(Self {
             device,
@@ -797,7 +860,7 @@ impl SparseOp {
             return Ok(());
         }
         match &self.resident {
-            OpResident::Cpu { csr, weights } => {
+            OpResident::Cpu { csr, weights, .. } => {
                 if self.device.backend == Backend::CpuParallel {
                     cpu_spmv_parallel(csr, weights, x, y);
                 } else {
@@ -810,6 +873,52 @@ impl SparseOp {
                 op.spmv(x, y);
                 Ok(())
             }
+        }
+    }
+
+    /// `y += Aᵀ · x`, using the values this operator holds.
+    ///
+    /// The reverse of [`SparseOp::spmv`]: `x` has one entry per **row** and `y`
+    /// one per **column**. This is the direction a gradient travels — given
+    /// `dy` over the outputs of a sparse layer, this produces `dx` over its
+    /// inputs.
+    ///
+    /// Requires an operator built by [`Device::prepare_with_transpose`]. One
+    /// built by [`Device::prepare`] has no reverse index and returns
+    /// [`OpError::TransposeNotPrepared`] rather than building one implicitly:
+    /// the index costs as much memory as the forward one, and a method that
+    /// silently doubles an operator's footprint the first time it is called is
+    /// worse than one that says it cannot.
+    ///
+    /// Both directions read the same weight table, so [`SparseOp::set_weights`]
+    /// updates them together.
+    pub fn spmv_t(&self, x: &[f32], y: &mut [f32]) -> Result<(), OpError> {
+        require_min_len("x", x.len(), self.shape.nrows())?;
+        require_len("y", y.len(), self.shape.ncols())?;
+        if self.shape.ncols() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu { weights, csc, .. } => {
+                let csc = csc.as_ref().ok_or(OpError::TransposeNotPrepared)?;
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_spmv_t_parallel(csc, weights, x, y);
+                } else {
+                    cpu_spmv_t_sequential(csc, weights, x, y);
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.spmv_t(x, y),
+        }
+    }
+
+    /// Whether [`SparseOp::spmv_t`] can run on this operator.
+    pub fn has_transpose(&self) -> bool {
+        match &self.resident {
+            OpResident::Cpu { csc, .. } => csc.is_some(),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.has_transpose(),
         }
     }
 
@@ -836,7 +945,7 @@ impl SparseOp {
             return Ok(());
         }
         match &self.resident {
-            OpResident::Cpu { csr, weights } => {
+            OpResident::Cpu { csr, weights, .. } => {
                 if self.device.backend == Backend::CpuParallel {
                     cpu_fused_parallel(csr, weights, x, v, theta, spikes, params);
                 } else {
@@ -920,6 +1029,37 @@ fn row_dot(csr: &Csr, weights: &[f32], x: &[f32], r: usize) -> f32 {
         sum += weights[i] * x[csr.col[i] as usize];
     }
     sum
+}
+
+/// One output column of `Aᵀ · x`.
+///
+/// The CSC entry `k` names the CSR row it came from (`row[k]`, indexing `x`)
+/// and the slot its value occupies in the forward weight table
+/// (`edge_idx[k]`). One value table serves both directions, so a
+/// [`SparseOp::set_weights`] is visible to the forward and transposed products
+/// at once — there is no second copy to fall out of step.
+#[inline]
+fn col_dot(csc: &Csc, weights: &[f32], x: &[f32], c: usize) -> f32 {
+    let start = csc.col_ptr[c] as usize;
+    let end = csc.col_ptr[c + 1] as usize;
+    let mut sum = 0.0f32;
+    for k in start..end {
+        sum += weights[csc.edge_idx[k] as usize] * x[csc.row[k] as usize];
+    }
+    sum
+}
+
+fn cpu_spmv_t_sequential(csc: &Csc, weights: &[f32], x: &[f32], y: &mut [f32]) {
+    for (c, y_val) in y.iter_mut().enumerate() {
+        *y_val += col_dot(csc, weights, x, c);
+    }
+}
+
+fn cpu_spmv_t_parallel(csc: &Csc, weights: &[f32], x: &[f32], y: &mut [f32]) {
+    use rayon::prelude::*;
+    y.par_iter_mut().enumerate().for_each(|(c, y_val)| {
+        *y_val += col_dot(csc, weights, x, c);
+    });
 }
 
 fn cpu_spmv_sequential(csr: &Csr, weights: &[f32], x: &[f32], y: &mut [f32]) {

@@ -32,8 +32,8 @@ use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device as MtlDevice, MTLResourceOptions, MTLSize,
 };
 
-use super::{LifParams, SparsePlanError, SparseShape};
-use crate::sparse::Csr;
+use super::{LifParams, OpError, SparsePlanError, SparseShape};
+use crate::sparse::{Csc, Csr};
 
 const KERNEL_SOURCE: &str = include_str!("../kernels/spmv.metal");
 
@@ -101,6 +101,7 @@ pub struct MetalDevice {
     device: MtlDevice,
     queue: CommandQueue,
     spmv: ComputePipelineState,
+    spmv_t: ComputePipelineState,
     lif: ComputePipelineState,
     fused: ComputePipelineState,
 }
@@ -141,6 +142,7 @@ impl MetalDevice {
         };
 
         let spmv = pipeline("csr_spmv_kernel")?;
+        let spmv_t = pipeline("csc_spmv_t_kernel")?;
         let lif = pipeline("lif_integrate_kernel")?;
         let fused = pipeline("fused_spmv_lif_simdgroup_kernel")?;
 
@@ -179,6 +181,7 @@ impl MetalDevice {
             device,
             queue,
             spmv,
+            spmv_t,
             lif,
             fused,
         })
@@ -267,13 +270,32 @@ impl MetalDevice {
         csr: &Csr,
         shape: SparseShape,
         weights: &[f32],
+        csc: Option<&Csc>,
     ) -> Result<MetalSparse, SparsePlanError> {
         let row_ptr = self.upload(&csr.row_ptr, "row_ptr")?;
         let col = self.upload(&csr.col, "col")?;
         let values = self.upload(weights, "values")?;
+        let transpose = match csc {
+            Some(c) => Some(TransposeIndex {
+                col_ptr: self.upload(&c.col_ptr, "csc_col_ptr")?,
+                row: self.upload(&c.row, "csc_row")?,
+                edge_idx: self.upload(&c.edge_idx, "csc_edge_idx")?,
+            }),
+            None => None,
+        };
         let scratch = Scratch {
             x: self.alloc::<f32>(shape.ncols, "x")?,
             y: self.alloc_guarded::<f32>(shape.nrows, "y")?,
+            // Allocated only alongside the reverse index, so a forward-only
+            // operator pays neither the index nor the scratch.
+            yt: match csc {
+                Some(_) => Some(self.alloc_guarded::<f32>(shape.ncols, "yt")?),
+                None => None,
+            },
+            xt: match csc {
+                Some(_) => Some(self.alloc::<f32>(shape.nrows, "xt")?),
+                None => None,
+            },
             v: self.alloc_guarded::<f32>(shape.nrows, "v")?,
             theta: self.alloc_guarded::<f32>(shape.nrows, "theta")?,
             spikes: self.alloc_guarded::<u8>(shape.nrows, "spikes")?,
@@ -284,6 +306,7 @@ impl MetalDevice {
             row_ptr,
             col,
             values,
+            transpose,
             shape,
             scratch: Mutex::new(scratch),
         })
@@ -414,6 +437,12 @@ impl Guarded {
 struct Scratch {
     x: Buffer,
     y: Guarded,
+    /// Transposed output, `ncols` long. Separate from `y` because the two
+    /// directions have different lengths and a shared buffer sized for the
+    /// larger would let a length bug read the other's stale tail.
+    yt: Option<Guarded>,
+    /// Row-length input for the transposed product.
+    xt: Option<Buffer>,
     v: Guarded,
     theta: Guarded,
     spikes: Guarded,
@@ -428,8 +457,18 @@ pub struct MetalSparse {
     /// The operator's values, resident for its lifetime. Uploading these per
     /// call is what made the GPU arm lose to rayon at every size.
     values: Buffer,
+    /// Reverse index, present only when the operator was prepared for it.
+    /// `edge_idx` points into `values`, so both directions read one table.
+    transpose: Option<TransposeIndex>,
     shape: SparseShape,
     scratch: Mutex<Scratch>,
+}
+
+/// CSC device buffers backing `csc_spmv_t_kernel`.
+struct TransposeIndex {
+    col_ptr: Buffer,
+    row: Buffer,
+    edge_idx: Buffer,
 }
 
 impl MetalSparse {
@@ -462,6 +501,54 @@ impl MetalSparse {
         scratch.y.assert_intact();
         read_into(&scratch.y.buffer, y);
         drop(scratch);
+    }
+
+    /// Whether this operator carries a reverse index.
+    pub fn has_transpose(&self) -> bool {
+        self.transpose.is_some()
+    }
+
+    /// `y += Aᵀ · x`. Lengths are checked by the caller in `SparseOp::spmv_t`.
+    ///
+    /// Returns [`OpError::TransposeNotPrepared`] rather than panicking when the
+    /// operator has no reverse index: `SparseOp::spmv_t` checks the CPU arm the
+    /// same way, and both arms must refuse identically or the error becomes a
+    /// property of which backend you happened to open.
+    pub fn spmv_t(&self, x: &[f32], y: &mut [f32]) -> Result<(), OpError> {
+        let idx = self
+            .transpose
+            .as_ref()
+            .ok_or(OpError::TransposeNotPrepared)?;
+        let scratch = self.scratch.lock().expect("sparsl scratch mutex poisoned");
+        let (xt, yt) = match (scratch.xt.as_ref(), scratch.yt.as_ref()) {
+            (Some(xt), Some(yt)) => (xt, yt),
+            // Unreachable: scratch and index are allocated together in
+            // `prepare`. Refusing beats unwrapping if that ever stops holding.
+            _ => return Err(OpError::TransposeNotPrepared),
+        };
+        write_from(xt, &x[..self.shape.nrows]);
+        yt.write(y);
+
+        let tg = self.device.threadgroup_for(&self.device.spmv_t);
+        let cb = self.device.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.device.spmv_t);
+        enc.set_buffer(0, Some(&idx.col_ptr), 0);
+        enc.set_buffer(1, Some(&idx.row), 0);
+        enc.set_buffer(2, Some(&idx.edge_idx), 0);
+        enc.set_buffer(3, Some(&self.values), 0);
+        enc.set_buffer(4, Some(xt), 0);
+        enc.set_buffer(5, Some(&yt.buffer), 0);
+        set_u32(enc, 6, self.shape.ncols as u32);
+        enc.dispatch_threads(size(self.shape.ncols as u64), size(tg));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        yt.assert_intact();
+        read_into(&yt.buffer, y);
+        drop(scratch);
+        Ok(())
     }
 
     /// Fused SpMV + LIF. Lengths are checked by the caller.

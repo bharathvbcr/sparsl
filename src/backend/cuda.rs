@@ -27,7 +27,7 @@
 //! 1. Add a `cudarc` (or equivalent) optional dependency behind the existing
 //!    `cuda` feature.
 //! 2. Add `CudaDevice` / `CudaSparse` here, mirroring
-//!    [`crate::backend::metal`]: `open()`, `prepare()`, `spmv()`,
+//!    the crate-private `backend::metal` module: `open()`, `prepare()`, `spmv()`,
 //!    `lif_integrate()`, `fused_spmv_lif()`.
 //! 3. Port `src/kernels/spmv.metal` to CUDA C. The three kernels are small and
 //!    the bounds-guard contract is identical; `SparseOp::prepare` already

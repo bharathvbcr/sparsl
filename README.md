@@ -172,6 +172,41 @@ stateDiagram-v2
 
 That note is the reason the differential suite treats spikes inside a tolerance band around threshold as legitimately ambiguous, and demands exact agreement everywhere else.
 
+### The transposed product
+
+`SparseOp::spmv_t` computes `y += Aᵀ · x` — the direction a gradient travels. Given `dy` over a sparse layer's outputs it produces `dx` over its inputs, which is what a learning rule needs and what a forward-only SpMV cannot give.
+
+It walks a CSC reverse index rather than materialising `Aᵀ`. Each CSC entry names the CSR row it came from and the slot its value occupies in the *forward* weight table, so one value table serves both directions and `set_weights` updates them together — there is no second copy to fall out of step.
+
+```mermaid
+flowchart LR
+    accTitle: Forward and Transposed Products Share One Weight Table
+    accDescr: The CSR index drives the forward product and the CSC reverse index drives the transposed one, but both read the same values array, so a weight update reaches both directions at once.
+
+    w["📊 values[nnz]<br/>(one table)"]
+    csr["➡️ CSR row_ptr / col"]
+    csc["⬅️ CSC col_ptr / row / edge_idx"]
+    fwd["y[nrows] += A · x[ncols]"]
+    bwd["y[ncols] += Aᵀ · x[nrows]"]
+
+    csr --> fwd
+    csc --> bwd
+    w --> fwd
+    w --> bwd
+
+    classDef shared fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a5f
+    classDef idx fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef out fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+
+    class w shared
+    class csr,csc idx
+    class fwd,bwd out
+```
+
+The reverse index costs as much memory as the forward one, so it is opt-in: build the operator with `Device::prepare_with_transpose`. An operator from `Device::prepare` returns `OpError::TransposeNotPrepared` rather than building one implicitly, because a method that silently doubles an operator's footprint the first time it is called is worse than one that says it cannot.
+
+Correctness is gated on the inner-product identity `⟨A·x, y⟩ == ⟨x, Aᵀ·y⟩`, which is the definition of the transpose. A wrong-but-plausible implementation — indices swapped, the weight table read by CSC position instead of `edge_idx` — still looks like a sparse product and still fails that identity. Both mutations were injected and both were caught.
+
 ---
 
 ## 🎯 Reproducibility, and where it stops
@@ -286,6 +321,20 @@ All thirteen stress tests passed on their first run, which is precisely when a s
 | Widen a tolerance to `f32::MAX` | A tolerance can fail upward and make an entire suite vacuous | Upper as well as lower bounds asserted on both tolerance formulas |
 
 Re-verification after the fixes: every former survivor is now caught.
+
+---
+
+## 🧭 Known gaps
+
+Recorded rather than implied. Everything the crate *contains* is wired, tested and documented; these are capabilities it does not have yet.
+
+| Gap | Why it matters | Why not yet |
+|---|---|---|
+| **SpMM** — sparse × dense *matrix* | A single-vector SpMV leaves the GPU mostly idle, which is why Metal only overtakes rayon at N ≥ 10,000. A batch dimension would make it win at every size. | Needs its own tiling and tolerance analysis; a batched reduction has a different error bound from the per-row one `tolerance_for_spmv` derives. |
+| **GPU scan** | `assoc_scan` is one of the crate's two headline primitives and is rayon-only. | The chunked scan's bit-identity guarantee rests on a sequential left-fold at chunk boundaries; reproducing that exactly on a GPU is a design question, not a port. |
+| **f16 / bf16 / bitpacked spikes** | SpMV is bandwidth-bound, so f16 is a straight 2x. A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. |
+| **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
+| **`block 0.1.6`** | Arrives via `metal 0.29`, is unmaintained, and trips a future-incompatibility lint that will become a hard error. | Bumping does not fix it — 0.33 pulls the same crate (verified). The real fix is migrating this backend to `objc2-metal`, which `tessl` already uses; that is a rewrite of `src/backend/metal.rs`, tracked separately. |
 
 ---
 

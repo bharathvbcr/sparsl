@@ -10,6 +10,16 @@ keywords = ["sparse", "spmv", "simd", "metal", "deterministic"]
 categories = ["science", "algorithms", "hardware-support"]
 license = "MIT OR Apache-2.0"
 
+# The Metal backend is `cfg(all(target_os = "macos", feature = "metal"))`, so a
+# default x86_64-linux docs build would render the crate with `Backend::Metal`
+# permanently unavailable and `backend::metal` missing entirely — documenting
+# the half of the crate that is not the interesting half.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+features = ["metal"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 # Native Metal compute on Apple silicon. Verified end-to-end against the CPU
@@ -27,6 +37,16 @@ rand_chacha = "0.3"
 rayon = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Pinned at 0.29 deliberately. Every release of `metal` in the gfx-rs line,
+# 0.33 included, pulls `block 0.1.6`, which is unmaintained and triggers the
+# `static of uninhabited type` future-incompatibility lint — it will be a hard
+# error in a future Rust. Bumping does not fix that (verified against 0.33), so
+# the version churn would buy nothing.
+#
+# The real fix is migrating this backend to `objc2-metal`, which the sibling
+# `tessl` crate already uses and which has no `block` dependency. That is a
+# rewrite of `src/backend/metal.rs`, not a version bump, and it is tracked as
+# its own change rather than smuggled into an unrelated one.
 metal = { version = "0.29", optional = true }
 objc = { version = "0.2", optional = true }
 
