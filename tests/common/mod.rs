@@ -187,6 +187,8 @@ pub const SHAPES: &[(usize, usize, usize)] = &[
 pub fn shape_label(shape: SparseShape) -> String {
     format!(
         "nrows={} ncols={} nnz={}",
-        shape.nrows, shape.ncols, shape.nnz
+        shape.nrows(),
+        shape.ncols(),
+        shape.nnz()
     )
 }

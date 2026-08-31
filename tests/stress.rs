@@ -89,6 +89,34 @@ fn out_of_range_columns_never_reach_a_device() {
     }
 }
 
+/// `Csr::ncols()` incremented the maximum column index in `u32`.
+///
+/// With `u32::MAX` stored — reachable via `from_parts_unchecked`, and already
+/// constructed by `out_of_range_columns_never_reach_a_device` above — that
+/// aborted in debug and wrapped to `0` in release, reporting a graph with no
+/// columns. A caller writing the natural `device.prepare(&csr, csr.ncols(), &w)`
+/// got either a crash or silent nonsense.
+#[test]
+fn ncols_does_not_overflow_on_a_maximal_column_index() {
+    let csr = Csr::from_parts_unchecked(vec![0, 1], vec![u32::MAX]);
+    assert_eq!(
+        csr.ncols(),
+        u32::MAX as usize + 1,
+        "ncols must widen before incrementing"
+    );
+
+    // And the value it reports must be one a caller can actually use: the
+    // resulting shape has to be rejected for exceeding the u32 index range
+    // rather than accepted and handed to a kernel.
+    let err = Device::cpu_sequential()
+        .prepare(&csr, csr.ncols(), &[1.0])
+        .expect_err("an ncols beyond u32::MAX must not be preparable");
+    assert!(
+        matches!(err, SparsePlanError::TooLarge { .. }),
+        "expected TooLarge, got {err:?}"
+    );
+}
+
 #[test]
 fn structurally_invalid_csr_is_rejected() {
     let device = Device::cpu_sequential();
@@ -361,7 +389,7 @@ fn degenerate_shapes_are_no_ops_not_crashes() {
         let op = device
             .prepare(&Csr::from_parts_unchecked(vec![0], vec![]), 4, &[])
             .expect("zero-row CSR is valid");
-        assert_eq!(op.shape().nrows, 0);
+        assert_eq!(op.shape().nrows(), 0);
         op.spmv(&[1.0; 4], &mut []).expect("zero-row spmv");
         op.fused_spmv_lif(&[1.0; 4], &mut [], &mut [], &mut [], params)
             .expect("zero-row fused");
@@ -370,7 +398,7 @@ fn degenerate_shapes_are_no_ops_not_crashes() {
         let op = device
             .prepare(&Csr::empty(8), 4, &[])
             .expect("edgeless CSR");
-        assert_eq!(op.shape().nnz, 0);
+        assert_eq!(op.shape().nnz(), 0);
         let mut y = vec![7.0f32; 8];
         op.spmv(&[1.0; 4], &mut y).expect("edgeless spmv");
         assert!(

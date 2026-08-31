@@ -8,9 +8,26 @@
 //! scan does **NOT** parallelize across reset events.
 //!
 //! Use [`assoc_scan`] inside reset-free chunks (or between resets). Across a
-//! reset, fall back to sequential time. Neuron / area / stream parallelism
-//! remains the primary throughput lever; chunked scan is only a partial
-//! parallel-in-time assist for the linear dynamics.
+//! reset, fall back to sequential time.
+//!
+//! # What this actually buys, measured
+//!
+//! Not speed. Phase 1 of [`assoc_scan_chunked`] is a *complete sequential
+//! left-fold over every element* — it has to be, because recording the exact
+//! prefix at each chunk boundary is what makes the parallel phase bit-identical
+//! to a sequential scan. Phase 2 then redoes that work in parallel. So the
+//! total is roughly `2n` `combine` calls to replace `n`.
+//!
+//! Measured on 4M elements with all cores idle: 6.92 ms chunked against 7.48 ms
+//! sequential. **1.08x.** Earlier wording here called it "a partial
+//! parallel-in-time assist"; at that margin it is not one, and describing it as
+//! such invites someone to reach for it expecting a speedup.
+//!
+//! What it buys is the *property*: a chunked, rayon-backed scan whose output is
+//! bit-identical to the sequential fold, which is what lets the parallel path be
+//! used at all where results are replayed by hash. A Blelloch-style two-level
+//! scan would deliver a real speedup and would not be bit-identical. Neuron,
+//! area and stream parallelism remain the throughput lever.
 
 use rayon::prelude::*;
 

@@ -17,7 +17,44 @@
 //! must not change is that the answer is one of these two.
 mod common;
 use common::*;
-use sparsl::{Backend, Device, Rng};
+use sparsl::{tolerance_for_elementwise, Backend, Device, Rng};
+
+/// The tolerance must be sized by the largest OPERAND, not the result.
+///
+/// Contraction rounds at the magnitude of `v * decay`. Under cancellation the
+/// result is arbitrarily smaller than that product, so a bound computed from
+/// the result collapses toward zero while the real deviation does not. The case
+/// below is the one an audit produced: the CPU lands on exactly `0.0` and the
+/// fused form on `-5.96e-8`, so a result-sized bound is 3e-45 against a real
+/// deviation of 5.96e-8.
+#[test]
+fn elementwise_tolerance_survives_cancellation() {
+    let v = 0.99999106f32;
+    let decay = 1.1f32;
+    let current = -1.0999901f32;
+
+    let separate = v * decay + current;
+    let fused = v.mul_add(decay, current);
+    let deviation = (separate - fused).abs();
+    assert!(
+        deviation > 0.0,
+        "this case is only meaningful while the two roundings differ"
+    );
+
+    let from_result = tolerance_for_elementwise(separate.abs().max(fused.abs()));
+    assert!(
+        from_result < deviation,
+        "the counterexample no longer demonstrates the failure: a result-sized \
+         bound of {from_result} already covers a deviation of {deviation}"
+    );
+
+    let from_operand = tolerance_for_elementwise((v * decay).abs().max(current.abs()));
+    assert!(
+        from_operand >= deviation,
+        "an operand-sized bound of {from_operand} must cover the {deviation} \
+         that contraction actually produces"
+    );
+}
 
 #[test]
 fn metal_membrane_matches_one_of_the_two_roundings() {

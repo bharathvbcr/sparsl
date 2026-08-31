@@ -106,11 +106,12 @@ impl Csr {
     /// Hoist it into a `let` before the loop.
     #[inline]
     pub fn ncols(&self) -> usize {
-        self.col
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |m| (m + 1) as usize)
+        // Widen before the increment. Doing `(m + 1) as usize` overflows in
+        // `u32` for a `u32::MAX` column index: debug aborts, release wraps to
+        // `0` and reports a graph with no columns. `from_parts_unchecked`
+        // makes that index reachable, and `tests/stress.rs` already builds
+        // exactly this CSR.
+        self.col.iter().copied().max().map_or(0, |m| m as usize + 1)
     }
 
     /// Column indices of neighbors for `row`.

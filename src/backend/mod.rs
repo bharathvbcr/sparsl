@@ -27,8 +27,20 @@ use core::fmt;
 
 use crate::sparse::Csr;
 
+// Crate-private on purpose. `MetalDevice::prepare` takes a `SparseShape` and
+// performs no validation of its own — it trusts that the shape came from
+// `SparseOp::prepare`, which proved every column index in range. While this
+// module was `pub`, that trust was unenforceable: an external caller could pair
+// `Csr::from_parts_unchecked` with a hand-built `SparseShape` and reach the
+// kernels directly, and the kernels index `x[col[i]]` with no bounds check. An
+// audit demonstrated an out-of-bounds device read from safe, `forbid(unsafe_code)`
+// caller code that way.
+//
+// Reachability is now the enforcement: `SparseOp` really is the only route to a
+// sparse kernel, because nothing outside this crate can name the type that
+// would bypass it.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod metal;
+pub(crate) mod metal;
 
 pub mod cuda;
 
@@ -346,19 +358,45 @@ fn require_min_len(what: &'static str, got: usize, min: usize) -> Result<(), OpE
 // ---------------------------------------------------------------------------
 
 /// Validated dimensions of a prepared sparse operator.
+///
+/// The fields are private and there is no public constructor, so a value of
+/// this type can only have come from [`validate_csr`]. That is deliberate and
+/// load-bearing rather than mere encapsulation: the GPU kernels index
+/// `x[col[i]]` with no bounds check, and a `SparseShape` is the token that says
+/// the indices were checked. If a caller could build one, the token would mean
+/// nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SparseShape {
-    pub nrows: usize,
-    pub ncols: usize,
-    pub nnz: usize,
+    nrows: usize,
+    ncols: usize,
+    nnz: usize,
+    max_row_nnz: usize,
+}
+
+impl SparseShape {
+    /// Number of rows.
+    pub const fn nrows(self) -> usize {
+        self.nrows
+    }
+
+    /// Declared number of columns; every stored index is `< ncols`.
+    pub const fn ncols(self) -> usize {
+        self.ncols
+    }
+
+    /// Total stored non-zeros.
+    pub const fn nnz(self) -> usize {
+        self.nnz
+    }
+
     /// Stored non-zeros in the longest row.
     ///
     /// Separate from the mean because error bounds depend on the longest row,
     /// not the average one. See [`SparseShape::nnz_per_row`].
-    pub max_row_nnz: usize,
-}
+    pub const fn max_row_nnz(self) -> usize {
+        self.max_row_nnz
+    }
 
-impl SparseShape {
     /// Mean stored non-zeros per row, rounded up.
     ///
     /// **Do not size an error tolerance with this.** A ragged operator — most
@@ -384,15 +422,28 @@ impl SparseShape {
 /// rounding once where the CPU rounds twice, which moves the result by up to an
 /// ulp. `tests/fma_contraction.rs` pins this behaviour.
 ///
-/// Two ulps of the larger operand covers the omitted rounding with margin.
+/// # Pass the largest OPERAND, not the result
+///
+/// The omitted rounding happens at the magnitude of the product `v * decay`,
+/// which under cancellation is unboundedly larger than the result. An earlier
+/// signature named this parameter `max_abs_result`, and an audit produced the
+/// counterexample: `v = 0.99999106`, `decay = 1.1`, `current = -1.0999901`
+/// gives exactly `0.0` on the CPU and `-5.96e-8` fused — a real deviation of
+/// 5.96e-8 against a bound of 3e-45 computed from the result. Under-bound by
+/// some thirty-seven orders of magnitude.
+///
+/// So `max_abs_operand` must cover `|v * decay|`, `|current|` and `|theta|`,
+/// none of which cancellation can shrink.
+///
+/// Two ulps of that magnitude covers the omitted rounding with margin.
 ///
 /// The reason this matters more than an ulp usually does: the value it perturbs
 /// is immediately compared against a threshold. A membrane sitting within an ulp
 /// of `theta` can spike on one substrate and not the other — a boolean
 /// difference out of a rounding difference. Comparisons across substrates must
 /// treat spikes in that band as legitimately ambiguous.
-pub fn tolerance_for_elementwise(max_abs_result: f32) -> f32 {
-    let magnitude = max_abs_result.abs().max(f32::MIN_POSITIVE);
+pub fn tolerance_for_elementwise(max_abs_operand: f32) -> f32 {
+    let magnitude = max_abs_operand.abs().max(f32::MIN_POSITIVE);
     2.0 * f32::EPSILON * magnitude
 }
 
@@ -724,7 +775,7 @@ impl SparseOp {
     ///
     /// The path a learning rule uses: connectivity is fixed, values move.
     pub fn set_weights(&mut self, weights: &[f32]) -> Result<(), OpError> {
-        require_len("weights", weights.len(), self.shape.nnz)?;
+        require_len("weights", weights.len(), self.shape.nnz())?;
         match &mut self.resident {
             OpResident::Cpu {
                 weights: stored, ..
@@ -740,9 +791,9 @@ impl SparseOp {
 
     /// `y += A · x`, using the values this operator holds.
     pub fn spmv(&self, x: &[f32], y: &mut [f32]) -> Result<(), OpError> {
-        require_min_len("x", x.len(), self.shape.ncols)?;
-        require_len("y", y.len(), self.shape.nrows)?;
-        if self.shape.nrows == 0 {
+        require_min_len("x", x.len(), self.shape.ncols())?;
+        require_len("y", y.len(), self.shape.nrows())?;
+        if self.shape.nrows() == 0 {
             return Ok(());
         }
         match &self.resident {
@@ -777,11 +828,11 @@ impl SparseOp {
         spikes: &mut [bool],
         params: LifParams,
     ) -> Result<(), OpError> {
-        require_min_len("x", x.len(), self.shape.ncols)?;
-        require_len("v", v.len(), self.shape.nrows)?;
-        require_len("theta", theta.len(), self.shape.nrows)?;
-        require_len("spikes", spikes.len(), self.shape.nrows)?;
-        if self.shape.nrows == 0 {
+        require_min_len("x", x.len(), self.shape.ncols())?;
+        require_len("v", v.len(), self.shape.nrows())?;
+        require_len("theta", theta.len(), self.shape.nrows())?;
+        require_len("spikes", spikes.len(), self.shape.nrows())?;
+        if self.shape.nrows() == 0 {
             return Ok(());
         }
         match &self.resident {

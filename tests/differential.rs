@@ -59,7 +59,7 @@ fn spmv_matches_reference_across_shapes() {
             // depends on the magnitude `y` actually reached, which is not
             // knowable from the inputs alone.
             let tol = tolerance_for_spmv(
-                shape.max_row_nnz,
+                shape.max_row_nnz(),
                 max_abs_term(&weights, &x),
                 max_abs(&y_ref),
             );
@@ -100,7 +100,7 @@ fn spmv_accumulates_rather_than_overwrites() {
         // Three accumulations feed one result, so the row work triples and the
         // magnitude to bound is the one `y` actually reached.
         let tol = tolerance_for_spmv(
-            op.shape().max_row_nnz * 3,
+            op.shape().max_row_nnz() * 3,
             max_abs_term(&weights, &x),
             max_abs(&y_ref),
         );
@@ -140,7 +140,7 @@ fn fused_spmv_lif_matches_reference_across_shapes() {
             let op = device.prepare(&csr, ncols, &weights).expect("valid");
             let shape = op.shape();
             let tol = tolerance_for_spmv(
-                shape.max_row_nnz,
+                shape.max_row_nnz(),
                 max_abs_term(&weights, &x),
                 v0.iter()
                     .chain(theta0.iter())
@@ -301,7 +301,7 @@ proptest! {
             let mut y_got = y0.clone();
             op.spmv(&x, &mut y_got).expect("got");
             let tol = tolerance_for_spmv(
-                op.shape().max_row_nnz,
+                op.shape().max_row_nnz(),
                 max_abs_term(&weights, &x),
                 max_abs(&y_ref),
             );

@@ -144,6 +144,37 @@ impl MetalDevice {
         let lif = pipeline("lif_integrate_kernel")?;
         let fused = pipeline("fused_spmv_lif_simdgroup_kernel")?;
 
+        // `SIMD_WIDTH` is baked into both sides of the fused kernel: the host
+        // derives `rows_per_group = threadgroup / 32`, and the kernel computes
+        // `row = group_id * (threads_per_group / 32) + simdgroup_id` while
+        // striding `i += 32`.
+        //
+        // On a device with a 64-wide execution width both halves are wrong in
+        // ways nothing else would catch: rows past `threadgroup / 64` per group
+        // are never written at all — they silently keep their input values —
+        // and the stride-32 loop double-counts every entry inside a 64-lane
+        // `simd_sum`. No canary trips, because nothing is written out of
+        // bounds. The result is simply wrong, quietly.
+        //
+        // `Backend::Metal`'s availability check only asks whether a Metal
+        // device exists, which an Intel Mac with an AMD GPU satisfies. So the
+        // assumption is checked here rather than assumed from the marketing
+        // name of the platform.
+        for (name, pipeline) in [
+            ("csr_spmv_kernel", &spmv),
+            ("lif_integrate_kernel", &lif),
+            ("fused_spmv_lif_simdgroup_kernel", &fused),
+        ] {
+            let width = pipeline.thread_execution_width();
+            if width != SIMD_WIDTH {
+                return Err(leak(format!(
+                    "`{name}` reports a SIMD execution width of {width}, but sparsl's \
+                     kernels are written for {SIMD_WIDTH}. Refusing to run rather than \
+                     produce silently wrong rows."
+                )));
+            }
+        }
+
         Ok(Self {
             device,
             queue,
@@ -166,7 +197,10 @@ impl MetalDevice {
     /// `threads_per_threadgroup / 32` is the exact number of rows per group.
     fn fused_threadgroup(&self) -> u64 {
         let cap = self.threadgroup_for(&self.fused);
-        (cap / SIMD_WIDTH).max(1) * SIMD_WIDTH
+        // Round down to a whole number of SIMD groups, then clamp: the `.max(1)`
+        // alone would round a sub-32 cap *up* to 32 and dispatch a threadgroup
+        // larger than the pipeline permits.
+        ((cap / SIMD_WIDTH).max(1) * SIMD_WIDTH).min(cap.max(1))
     }
 
     /// Allocate a zeroed device buffer of `len` elements of `T`.
@@ -319,6 +353,25 @@ struct Guarded {
 }
 
 impl Guarded {
+    /// Copy `src` into the usable region, refusing to spill into the sentinel.
+    ///
+    /// `write_from` bounds-checks against `buffer.length()`, which for a
+    /// guarded buffer includes the sentinel tail. A host write of up to
+    /// `CANARY_ELEMS` too many elements therefore passes that check, lands in
+    /// the sentinel, and is then reported by `assert_intact` as *"a Metal
+    /// kernel wrote past the end"* — blaming the GPU for the host's mistake.
+    /// Checking the logical length here keeps the canary's accusation truthful.
+    fn write<T: Copy>(&self, src: &[T]) {
+        let bytes = std::mem::size_of_val(src);
+        assert!(
+            bytes <= self.len_bytes,
+            "sparsl: `{}` holds {} usable bytes, tried to write {bytes}",
+            self.what,
+            self.len_bytes
+        );
+        write_from(&self.buffer, src);
+    }
+
     /// Fill the sentinel region. Called once at allocation and again after any
     /// detected trip, so a second dispatch cannot report a stale failure.
     fn arm(&self) {
@@ -389,7 +442,7 @@ impl MetalSparse {
     pub fn spmv(&self, x: &[f32], y: &mut [f32]) {
         let scratch = self.scratch.lock().expect("sparsl scratch mutex poisoned");
         write_from(&scratch.x, &x[..self.shape.ncols]);
-        write_from(&scratch.y.buffer, y);
+        scratch.y.write(y);
 
         let tg = self.device.threadgroup_for(&self.device.spmv);
         let cb = self.device.queue.new_command_buffer();
@@ -422,8 +475,8 @@ impl MetalSparse {
     ) {
         let mut scratch = self.scratch.lock().expect("sparsl scratch mutex poisoned");
         write_from(&scratch.x, &x[..self.shape.ncols]);
-        write_from(&scratch.v.buffer, v);
-        write_from(&scratch.theta.buffer, theta);
+        scratch.v.write(v);
+        scratch.theta.write(theta);
 
         // Uniform dispatch: the kernel derives its row from
         // `threads_per_threadgroup`, which non-uniform dispatch would shrink for
@@ -519,8 +572,16 @@ fn write_from<T: Copy>(buffer: &Buffer, src: &[T]) {
     );
     // SAFETY: `StorageModeShared` buffers are host-visible for the lifetime of
     // the allocation; the length assertion above proves the destination range
-    // is inside it; `T: Copy` has no drop glue; and the caller holds the
-    // scratch mutex, so no other thread is touching this range.
+    // is inside it; and `T: Copy` has no drop glue.
+    //
+    // Exclusive access is established differently at each of the four call
+    // sites, so it is spelled out rather than asserted generically:
+    //   - `MetalSparse::spmv` / `fused_spmv_lif` hold the scratch mutex.
+    //   - `MetalSparse::set_weights` takes `&mut self`, which excludes any
+    //     concurrent dispatch, and every dispatch calls `wait_until_completed`
+    //     before returning, so no GPU work is reading `values` either.
+    //   - `MetalDevice::lif_integrate` writes only buffers it allocated inside
+    //     the same call, which no other thread can name.
     unsafe {
         std::ptr::copy_nonoverlapping(src.as_ptr(), buffer.contents() as *mut T, src.len());
     }
@@ -544,5 +605,47 @@ fn read_buffer_into<T: Copy>(buffer: &Buffer, dst: &mut [T]) {
     // produced these bytes was waited on before this call.
     unsafe {
         std::ptr::copy_nonoverlapping(buffer.contents() as *const T, dst.as_mut_ptr(), dst.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An over-long host write must be blamed on the host.
+    ///
+    /// `write_from` bounds-checks against `buffer.length()`, which for a guarded
+    /// buffer includes the sentinel tail — so a host write of a few elements too
+    /// many used to pass, land in the sentinel, and be reported by
+    /// `assert_intact` as a Metal kernel writing out of bounds. Debugging a GPU
+    /// kernel for a host bug is an expensive wrong turn.
+    #[test]
+    fn an_over_long_host_write_is_blamed_on_the_host() {
+        let Ok(device) = shared_device() else {
+            return; // no Metal device here; nothing to guard
+        };
+        let guarded = device
+            .alloc_guarded::<f32>(4, "test")
+            .expect("allocation of four elements");
+
+        // Fits exactly: allowed.
+        guarded.write(&[1.0f32; 4]);
+        guarded.assert_intact();
+
+        // One element too many still fits inside the allocation, because the
+        // sentinel tail is part of it. It must be refused anyway.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guarded.write(&[1.0f32; 5]);
+        }));
+        let payload = result.expect_err("a 5-element write into 4 usable elements must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("usable bytes"),
+            "the panic must name the host write, not a GPU overrun; got: {message}"
+        );
     }
 }
