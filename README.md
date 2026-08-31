@@ -291,20 +291,10 @@ Re-verification after the fixes: every former survivor is now caught.
 
 ## 🔗 Relationship to tessl
 
-[`tessl`](https://github.com/bharathvbcr/tessl) (currently a private repository) is the dense counterpart — a Metal 4 GEMM and encode runtime built on `objc2-metal`, `MTL4` argument tables and TensorOps. `sparsl` is sparse, CPU-first, and uses classic `metal` 0.29 encode.
+[`tessl`](https://github.com/bharathvbcr/tessl) is the dense counterpart — a Metal 4 GEMM and encode runtime built on `objc2-metal`, `MTL4` argument tables and TensorOps. `sparsl` is sparse, CPU-first, and uses classic `metal` 0.29 encode.
 
 They are deliberately separate crates. `tessl`'s runtime, dispatch and tensor modules form a general Metal 4 compute runtime that `sparsl` could eventually sit on, but folding sparse SpMV and LIF kernels into a GEMM crate would blur what either one is. If `sparsl` moves to Metal 4, it should depend on that runtime rather than merge into it.
 
----
-
-## 📚 References
-
-- Mermaid diagrams in this README render natively on GitHub.[^1]
-- The recursive summation error bound behind `tolerance_for_nnz_per_row` is standard floating-point analysis.[^2]
-
-[^1]: GitHub Blog. (2022). "Include diagrams in your Markdown files with Mermaid." https://github.blog/2022-02-14-include-diagrams-markdown-files-mermaid/
-
-[^2]: Higham, N. J. (2002). *Accuracy and Stability of Numerical Algorithms*, 2nd ed. SIAM. Chapter 4, "Summation." https://epubs.siam.org/doi/book/10.1137/1.9780898718027
 
 ---
 
