@@ -26,6 +26,7 @@
 
 use core::fmt;
 
+use crate::scan::State;
 use crate::sparse::{Csc, Csr};
 
 // Crate-private on purpose. `MetalDevice::prepare` takes a `SparseShape` and
@@ -317,6 +318,9 @@ pub enum OpError {
     },
     /// [`SparseOp::spmv_t`] on an operator built without a reverse index.
     TransposeNotPrepared,
+    /// The substrate refused the work and said why. Distinct from the length
+    /// errors above: those are caller mistakes, this is the device declining.
+    Backend { reason: &'static str },
 }
 
 impl fmt::Display for OpError {
@@ -327,6 +331,7 @@ impl fmt::Display for OpError {
                 expected,
                 got,
             } => write!(f, "`{what}` must have length {expected}, got {got}"),
+            Self::Backend { reason } => write!(f, "backend refused: {reason}"),
             Self::TransposeNotPrepared => write!(
                 f,
                 "this operator has no reverse index; build it with \
@@ -685,6 +690,42 @@ impl Device {
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
         SparseOp::prepare(self.clone(), csr, ncols, weights, true)
+    }
+
+    /// Inclusive scan over affine maps, on this device's substrate.
+    ///
+    /// # This is the one place the crate's bit-identity rule bites
+    ///
+    /// The CPU arms run [`crate::assoc_scan`], which is bit-identical to a
+    /// sequential left-fold — it buys that by making its first phase a complete
+    /// sequential fold, about `2n` combines to replace `n`, measured at 1.08x.
+    /// The Metal arm runs a two-level Hillis-Steele scan that reassociates, so
+    /// it is genuinely parallel and is **not** bit-identical to the CPU arms.
+    ///
+    /// That is the rule this crate already states rather than an exception to
+    /// it: reproducibility holds *within* a backend and never across one. Two
+    /// runs on the same device agree byte for byte; comparing arms takes a
+    /// tolerance, exactly as [`SparseOp::spmv`] does.
+    ///
+    /// If you need a scan whose output is bit-identical to the sequential fold,
+    /// ask for a CPU backend explicitly. A GPU one cannot give it to you and
+    /// says so here rather than by silently differing.
+    pub fn assoc_scan(&self, xs: &[State]) -> Result<Vec<State>, OpError> {
+        match &self.inner {
+            DeviceInner::Cpu => Ok(if self.backend == Backend::CpuParallel {
+                crate::assoc_scan(xs, |a, b| a.combine(b))
+            } else {
+                crate::assoc_scan_sequential(xs, |a, b| a.combine(b))
+            }),
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            DeviceInner::Metal(d) => {
+                let pairs: Vec<(f32, f32)> = xs.iter().map(|s| (s.a, s.b)).collect();
+                let out = d
+                    .assoc_scan(&pairs)
+                    .map_err(|reason| OpError::Backend { reason })?;
+                Ok(out.into_iter().map(|(a, b)| State { a, b }).collect())
+            }
+        }
     }
 
     /// LIF membrane integrate over dense per-cell state.

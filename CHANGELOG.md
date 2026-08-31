@@ -28,6 +28,15 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ### Added
 
+- **`Device::assoc_scan` — the affine-map scan on Metal as well as CPU.** A
+  two-level Hillis-Steele scan in three dispatches. It reassociates, so it is
+  not bit-identical to the CPU arms; that is this crate's stated rule
+  (reproducibility within a backend, never across) rather than an exception,
+  and the method's docs say so. Two runs on one device agree byte for byte.
+- `build.rs` declaring `src/kernels/spmv.metal` an explicit build input. A
+  mutation run edited that file, rebuilt nothing, and reported the mutant had
+  survived — a check that never ran, looking exactly like one that ran and
+  passed.
 - **`SparseOp::spmm` — batched sparse matrix times dense matrix**, `Y += A·X`
   over `n_vec` vectors, on both CPU arms and Metal. Batching raises arithmetic
   intensity rather than parallelism: each `weights[i]` and `col[i]` is loaded

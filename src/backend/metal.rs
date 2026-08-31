@@ -82,6 +82,9 @@ const SIMD_WIDTH: usize = 32;
 ///
 /// 64 covers the largest realistic tail: `max_total_threads_per_threadgroup`
 /// is 1024 on Apple silicon, so a fused threadgroup spans at most 32 rows.
+/// Threadgroup scratch depth in the scan kernels.
+const SCAN_MAX_TG: usize = 1024;
+
 const CANARY_ELEMS: usize = 64;
 
 /// Sentinel bit pattern. A signalling NaN payload, chosen so that a kernel that
@@ -124,6 +127,9 @@ pub struct MetalDevice {
     spmv: ComputePipelineState,
     spmv_t: ComputePipelineState,
     spmm: ComputePipelineState,
+    scan_chunk: ComputePipelineState,
+    scan_offsets: ComputePipelineState,
+    scan_apply: ComputePipelineState,
     lif: ComputePipelineState,
     fused: ComputePipelineState,
 }
@@ -204,6 +210,9 @@ impl MetalDevice {
         let spmv = pipeline("csr_spmv_kernel")?;
         let spmv_t = pipeline("csc_spmv_t_kernel")?;
         let spmm = pipeline("csr_spmm_kernel")?;
+        let scan_chunk = pipeline("scan_chunk")?;
+        let scan_offsets = pipeline("scan_block_offsets")?;
+        let scan_apply = pipeline("scan_apply_offsets")?;
         let lif = pipeline("lif_integrate_kernel")?;
         let fused = pipeline("fused_spmv_lif_simdgroup_kernel")?;
 
@@ -244,6 +253,9 @@ impl MetalDevice {
             spmv,
             spmv_t,
             spmm,
+            scan_chunk,
+            scan_offsets,
+            scan_apply,
             lif,
             fused,
         })
@@ -384,6 +396,79 @@ impl MetalDevice {
             shape,
             scratch: Mutex::new(scratch),
         })
+    }
+
+    /// Inclusive scan over affine maps, in three dispatches.
+    ///
+    /// Not bit-identical to [`crate::assoc_scan`]: this reassociates, which is
+    /// what makes it parallel. That is within this crate's rule rather than an
+    /// exception to it — reproducibility holds inside a backend and never
+    /// across one. Two runs here agree byte for byte.
+    ///
+    /// Allocates per call. A scan has no persistent operator to hang buffers
+    /// off the way `SparseOp` does, and pre-sizing them would mean guessing a
+    /// length that changes every call.
+    pub fn assoc_scan(&self, xs: &[(f32, f32)]) -> Result<Vec<(f32, f32)>, &'static str> {
+        if xs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = xs.len();
+        // The Hillis-Steele tree doubles its offset each round and reads
+        // `lid + offset`; a non-power-of-two width would drop elements
+        // silently rather than failing, so round down.
+        let cap = self
+            .scan_chunk
+            .maxTotalThreadsPerThreadgroup()
+            .clamp(1, SCAN_MAX_TG);
+        let tptg = 1usize << (usize::BITS - 1 - cap.leading_zeros()) as usize;
+        let groups = n.div_ceil(tptg);
+
+        let flat: Vec<f32> = xs.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        let xs_buf = self
+            .upload(&flat, "scan xs")
+            .map_err(|_| "scan: could not upload input")?;
+        let out = self
+            .alloc::<f32>(n * 2, "scan out")
+            .map_err(|_| "scan: could not allocate output")?;
+        let totals = self
+            .alloc::<f32>(groups * 2, "scan totals")
+            .map_err(|_| "scan: could not allocate group totals")?;
+
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or("scan: Metal returned no command buffer")?;
+        let enc = cb
+            .computeCommandEncoder()
+            .ok_or("scan: Metal returned no compute encoder")?;
+
+        enc.setComputePipelineState(&self.scan_chunk);
+        set_buf(&enc, 0, &xs_buf);
+        set_buf(&enc, 1, &out);
+        set_buf(&enc, 2, &totals);
+        set_u32(&enc, 3, n as u32);
+        // Uniform threadgroups, not `dispatchThreads`: the tree needs every
+        // lane of a group present, and the kernel pads past `n` with the
+        // monoid identity so the extra lanes contribute nothing.
+        enc.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(tptg));
+
+        enc.setComputePipelineState(&self.scan_offsets);
+        set_buf(&enc, 0, &totals);
+        set_u32(&enc, 1, groups as u32);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(size(1), size(1));
+
+        enc.setComputePipelineState(&self.scan_apply);
+        set_buf(&enc, 0, &out);
+        set_buf(&enc, 1, &totals);
+        set_u32(&enc, 2, n as u32);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(tptg));
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+
+        let mut flat_out = vec![0.0f32; n * 2];
+        read_into(&out, &mut flat_out);
+        Ok(flat_out.chunks_exact(2).map(|c| (c[0], c[1])).collect())
     }
 
     /// Dense LIF integrate with no prepared operator.

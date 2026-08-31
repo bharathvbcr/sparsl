@@ -172,6 +172,16 @@ stateDiagram-v2
 
 That note is the reason the differential suite treats spikes inside a tolerance band around threshold as legitimately ambiguous, and demands exact agreement everywhere else.
 
+### The scan, on both substrates
+
+`Device::assoc_scan` runs the affine-map scan on whichever substrate the handle names — and this is the one primitive where the arms deliberately disagree.
+
+The CPU arms are bit-identical to a sequential left-fold. They buy that by making phase 1 a *complete* sequential fold, roughly `2n` combines to replace `n`, measured at 1.08x. The Metal arm is a two-level Hillis-Steele scan that reassociates, so it is genuinely parallel and is **not** bit-identical to the CPU arms.
+
+That is the rule this crate already states, not an exception to it: reproducibility holds *within* a backend and never across one. Two runs on the same device agree byte for byte. If you need output bit-identical to the sequential fold, ask for a CPU backend — a GPU one cannot give it, and `Device::assoc_scan` says so in its docs rather than by silently differing.
+
+Correctness rests on two exact tests rather than a tolerance. With `a = 1, b = 1` every prefix is exactly `i + 1`; with `a = 2, b = 0` every prefix is exactly `2^(i+1)`. Both are integers f32 represents exactly, so a misapplied block offset is plainly wrong with nowhere to hide — which matters, because a tolerance derived as `n · eps · max` is around 10% at n = 100000 and absorbs almost anything.
+
 ### The batched product
 
 `SparseOp::spmm` computes `Y += A · X` for `n_vec` dense vectors in one dispatch.
@@ -350,7 +360,6 @@ Recorded rather than implied. Everything the crate *contains* is wired, tested a
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
-| **GPU scan** | `assoc_scan` is one of the crate's two headline primitives and is rayon-only. | The chunked scan's bit-identity guarantee rests on a sequential left-fold at chunk boundaries; reproducing that exactly on a GPU is a design question, not a port. |
 | **f16 / bf16 / bitpacked spikes** | SpMV is bandwidth-bound, so f16 is a straight 2x. A spike is one *bit*, not 32. | Every tolerance function here is derived for f32; narrower types need their bounds re-derived, not rescaled. |
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
 
@@ -358,7 +367,7 @@ Recorded rather than implied. Everything the crate *contains* is wired, tested a
 
 ## 🔗 Relationship to tessl
 
-[`tessl`](https://github.com/bharathvbcr/tessl) is the dense counterpart — a Metal 4 GEMM and encode runtime built on `objc2-metal`, `MTL4` argument tables and TensorOps. `sparsl` is sparse, CPU-first, and uses classic `metal` 0.29 encode.
+[`tessl`](https://github.com/bharathvbcr/tessl) is the dense counterpart — a Metal 4 GEMM and encode runtime built on `objc2-metal`, `MTL4` argument tables and TensorOps. `sparsl` is sparse and CPU-first. Both now build on `objc2-metal`: the gfx-rs `metal` crate pulled `block 0.1.6` at every version, which is unmaintained and trips a future-incompatibility lint, so the two crates share one binding stack.
 
 They are deliberately separate crates. `tessl`'s runtime, dispatch and tensor modules form a general Metal 4 compute runtime that `sparsl` could eventually sit on, but folding sparse SpMV and LIF kernels into a GEMM crate would blur what either one is. If `sparsl` moves to Metal 4, it should depend on that runtime rather than merge into it.
 

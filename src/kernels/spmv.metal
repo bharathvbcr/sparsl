@@ -191,3 +191,93 @@ kernel void csr_spmm_kernel(
     }
     y[id] += sum;
 }
+
+// =============================================================================
+// Associative scan over affine maps `v' = a*v + b`.
+//
+// The CPU `assoc_scan` is bit-identical to a sequential left-fold, which it buys
+// by making phase 1 a *complete* sequential fold — about 2n combines to replace
+// n, measured at 1.08x. This is the other trade: a two-level Blelloch-style
+// scan that is genuinely parallel and is *not* bit-identical to the sequential
+// fold, because it reassociates.
+//
+// That is allowed by this crate's rule and not a weakening of it: reproducibility
+// holds *within* a backend and never across one. Two runs of this kernel on the
+// same device give byte-identical output; comparing it to the CPU arm is a
+// cross-backend comparison and takes a tolerance, exactly as SpMV does.
+// =============================================================================
+
+/// `combine(x, y)` = apply x, then y: `v -> y.a*(x.a*v + x.b) + y.b`.
+inline float2 scan_combine(float2 x, float2 y) {
+    return float2(y.x * x.x, y.x * x.y + y.y);
+}
+
+constant float2 SCAN_IDENTITY = float2(1.0f, 0.0f);
+constant uint SCAN_MAX_TG = 1024u;
+
+/// Inclusive scan within each threadgroup; also writes each group's total.
+///
+/// Hillis-Steele: `log2(tptg)` rounds, every lane active. More total work than
+/// a work-efficient Blelloch sweep, but half the barriers and no bank-conflict
+/// padding, which wins at these widths.
+kernel void scan_chunk(
+    device const float2* xs      [[buffer(0)]],
+    device float2*       out     [[buffer(1)]],
+    device float2*       totals  [[buffer(2)]],
+    constant uint&       n       [[buffer(3)]],
+    uint  gid  [[thread_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  grp  [[threadgroup_position_in_grid]],
+    uint  tptg [[threads_per_threadgroup]]
+) {
+    threadgroup float2 scratch[SCAN_MAX_TG];
+    scratch[lid] = (gid < n) ? xs[gid] : SCAN_IDENTITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = 1u; offset < tptg; offset <<= 1) {
+        float2 prev = (lid >= offset) ? scratch[lid - offset] : SCAN_IDENTITY;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scratch[lid] = scan_combine(prev, scratch[lid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (gid < n) { out[gid] = scratch[lid]; }
+    if (lid == tptg - 1u) { totals[grp] = scratch[lid]; }
+}
+
+/// Exclusive scan of the per-group totals, in one threadgroup.
+///
+/// `n_groups` is `ceil(n / tptg)`, so for any input a single group can span it
+/// while `tptg` stays at its cap — 1024 groups of 1024 is 2^20 elements, and
+/// beyond that the strided loop below still covers it sequentially per lane.
+kernel void scan_block_offsets(
+    device float2*  totals   [[buffer(0)]],
+    constant uint&  n_groups [[buffer(1)]],
+    uint lid [[thread_position_in_threadgroup]]
+) {
+    threadgroup float2 scratch[SCAN_MAX_TG];
+    // One lane walks the whole thing when there are more groups than lanes.
+    // Groups are few by construction, so this is not the hot path.
+    if (lid == 0u) {
+        float2 running = SCAN_IDENTITY;
+        for (uint g = 0u; g < n_groups; ++g) {
+            float2 total = totals[g];
+            totals[g] = running;              // exclusive prefix
+            running = scan_combine(running, total);
+        }
+    }
+    (void)scratch;
+}
+
+/// Fold each group's exclusive prefix into its elements.
+kernel void scan_apply_offsets(
+    device float2*       out    [[buffer(0)]],
+    device const float2* totals [[buffer(1)]],
+    constant uint&       n      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint grp [[threadgroup_position_in_grid]]
+) {
+    if (gid >= n) { return; }
+    // Group 0's prefix is the identity; combining anyway keeps every lane on
+    // one path and costs two multiplies.
+    out[gid] = scan_combine(totals[grp], out[gid]);
+}
