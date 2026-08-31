@@ -34,8 +34,9 @@ pub mod sparse;
 pub mod time;
 
 pub use backend::{
-    available_backends, tolerance_for_elementwise, tolerance_for_spmv, Backend, BackendUnavailable,
-    Device, LifParams, LifParamsError, OpError, SparseOp, SparsePlanError, SparseShape,
+    available_backends, tolerance_for_elementwise, tolerance_for_scan, tolerance_for_spmv, Backend,
+    BackendUnavailable, Device, LifParams, LifParamsError, OpError, SparseOp, SparsePlanError,
+    SparseShape,
 };
 pub use buffer::Buffer;
 pub use rng::Rng;

@@ -25,9 +25,38 @@
 //!
 //! What it buys is the *property*: a chunked, rayon-backed scan whose output is
 //! bit-identical to the sequential fold, which is what lets the parallel path be
-//! used at all where results are replayed by hash. A Blelloch-style two-level
-//! scan would deliver a real speedup and would not be bit-identical. Neuron,
-//! area and stream parallelism remain the throughput lever.
+//! used at all where results are replayed by hash. Neuron, area and stream
+//! parallelism remain the throughput lever.
+//!
+//! # The tree scan is slower, measured
+//!
+//! This text used to say a Blelloch-style two-level scan "would deliver a real
+//! speedup and would not be bit-identical". Half of that was right. The kernel
+//! now exists — [`crate::Device::assoc_scan`] on `Backend::Metal` — and it is
+//! **slower than the sequential CPU fold at every size measured**:
+//!
+//! ```text
+//!            cpu sequential      Metal        ratio
+//! n = 0.1M       0.09 ms         0.72 ms      0.13x
+//! n = 0.3M       0.39 ms         1.56 ms      0.26x
+//! n = 1.0M       1.61 ms         4.38 ms      0.37x
+//! n = 4.2M       6.47 ms        14.38 ms      0.45x
+//! ```
+//!
+//! Two full sweeps, arms timed in both orders, spreads at 4.2M within 1.19.
+//! The gap narrows as `n` grows — 0.13x to 0.45x — so the GPU is amortising
+//! its fixed costs, but it does not reach parity anywhere in this range.
+//!
+//! The reason is arithmetic intensity: composing two affine maps is three flops
+//! over eight bytes in and eight out, so this is purely memory-bound, and the
+//! three-phase tree makes roughly five passes over memory where the sequential
+//! fold makes one. More bandwidth does not rescue an algorithm that spends it
+//! on extra passes.
+//!
+//! So the tree scan is not a throughput lever either. It is there because
+//! `Backend::Metal` should be able to run every operation this crate offers
+//! rather than silently falling back — and `examples/scan_crossover.rs`
+//! reproduces the table above so the claim stays checkable.
 
 use rayon::prelude::*;
 

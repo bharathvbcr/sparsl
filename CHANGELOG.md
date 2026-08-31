@@ -8,6 +8,17 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ### Changed
 
+- `tolerance_for_scan` is public, and `tests/scan_backend.rs` asserts against it
+  rather than against a private copy of the same formula. Every other
+  cross-backend operation already exported its bound; the scan's lived only in
+  the test, so a caller comparing two backends could not reach it.
+- The prefix scan's performance is measured rather than predicted.
+  `Backend::Metal` is **slower than the sequential CPU fold at every size** —
+  0.13x at 0.1M rising to 0.45x at 4.2M. `scan.rs` previously asserted that a
+  two-level tree scan "would deliver a real speedup"; that claim is now
+  replaced by the table it was wrong about. `examples/scan_crossover.rs`
+  reproduces it.
+
 - **The Metal backend now uses `objc2-metal` instead of the gfx-rs `metal`
   crate.** That removes `block 0.1.6` and `objc 0.2` from the tree entirely.
   `block` is unmaintained and triggers the `static of uninhabited type`

@@ -320,6 +320,23 @@ Read this cautiously. The example exercises every arm before timing any of them 
 
 The honest summary: `rayon` wins the middle of the range, Metal pulls ahead at the top by a margin that is not large, and below roughly 5,000 non-zeros per row the sequential arm beats both because neither parallel substrate earns its dispatch overhead.
 
+### The prefix scan is slower on Metal, and that is the finding
+
+`cargo run --release --features metal --example scan_crossover` — same host, milliseconds for a full prefix scan over affine maps.
+
+| n | CPU sequential | Metal | ratio |
+| ---: | ---: | ---: | ---: |
+| 0.1M | **0.09** | 0.72 | 0.13x |
+| 0.3M | **0.39** | 1.56 | 0.26x |
+| 1.0M | **1.61** | 4.38 | 0.37x |
+| 4.2M | **6.47** | 14.38 | 0.45x |
+
+`Backend::Metal` loses at every size. `scan.rs` used to predict the opposite — that a two-level tree scan "would deliver a real speedup" — and that prediction is simply wrong here. Composing two affine maps is three flops over sixteen bytes moved, so the operation is memory-bound, and the three-phase tree makes roughly five passes over memory where a sequential fold makes one. Bandwidth does not rescue an algorithm that spends it on extra passes.
+
+The gap does narrow with `n` (0.13x to 0.45x), so the GPU is amortising fixed costs — it just does not reach parity anywhere in this range.
+
+The kernel ships anyway, for one reason: `Backend::Metal` should be able to run every operation this crate offers rather than silently falling back to CPU under a GPU label, which is precisely what [`Backend::Cuda`](#backend-status) refuses to do. It is documented as slow at its call site so nobody reaches for it expecting a win.
+
 ---
 
 ## 🧪 Testing

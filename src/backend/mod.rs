@@ -493,6 +493,37 @@ pub fn tolerance_for_spmv(max_row_nnz: usize, max_abs_term: f32, max_abs_result:
     8.0 * f32::EPSILON * n.mul_add(term, result)
 }
 
+/// Upper bound on the disagreement between two backends' prefix scans.
+///
+/// [`Device::assoc_scan`] is the one operation here whose *algorithm* differs
+/// by substrate. The CPU arms left-fold, and their output is bit-identical to
+/// [`crate::assoc_scan_sequential`]. Metal runs a two-level tree, which
+/// reassociates — and must, because bit-identity comes from a complete
+/// sequential fold that no tree reproduces. So a CPU/GPU comparison of a scan
+/// needs a bound, exactly as SpMV does, and this is it.
+///
+/// Composing `prefix_len` affine maps is a chain of that many multiply-adds in
+/// both `a` and `b`. Two parenthesizations of such a chain differ by the usual
+/// recursive-summation bound — proportional to the chain length and to the
+/// largest intermediate it reaches, not to the final value, which may be far
+/// smaller under cancellation:
+///
+/// ```text
+/// 8 · eps · prefix_len · max|intermediate|
+/// ```
+///
+/// `max_abs_intermediate` is the largest `|b|` the *reference* chain passes
+/// through, floored at 1 so a chain that stays near zero still admits the
+/// rounding of the `a` product. Pass the longest prefix compared, not the mean.
+///
+/// A bound, not a curve fitted to one machine — see [`tolerance_for_spmv`] for
+/// why that distinction is load-bearing here.
+pub fn tolerance_for_scan(prefix_len: usize, max_abs_intermediate: f32) -> f32 {
+    let n = prefix_len.max(1) as f32;
+    let magnitude = max_abs_intermediate.abs().max(1.0);
+    8.0 * f32::EPSILON * n * magnitude
+}
+
 // ---------------------------------------------------------------------------
 // Device
 // ---------------------------------------------------------------------------
@@ -710,6 +741,24 @@ impl Device {
     /// If you need a scan whose output is bit-identical to the sequential fold,
     /// ask for a CPU backend explicitly. A GPU one cannot give it to you and
     /// says so here rather than by silently differing.
+    ///
+    /// Size any cross-backend comparison with [`tolerance_for_scan`].
+    ///
+    /// # This is slower on Metal, measured
+    ///
+    /// Not a throughput path. At 4.2M elements the Metal arm takes ~14.4 ms
+    /// against ~6.5 ms for the sequential CPU fold — 0.45x — and it loses by
+    /// more at every smaller size (0.13x at 0.1M). A scan over affine maps is
+    /// three flops per
+    /// sixteen bytes moved, so it is memory-bound, and the three-phase tree
+    /// makes roughly five passes over memory where a fold makes one.
+    ///
+    /// It exists so `Backend::Metal` can run every operation this crate offers
+    /// rather than silently falling back to CPU under a GPU label, which is the
+    /// thing [`Backend::Cuda`] refuses to do. Reach for it when the data is
+    /// already resident on the GPU and moving it back would cost more than the
+    /// scan does — not for speed. `examples/scan_crossover.rs` reproduces the
+    /// numbers.
     pub fn assoc_scan(&self, xs: &[State]) -> Result<Vec<State>, OpError> {
         match &self.inner {
             DeviceInner::Cpu => Ok(if self.backend == Backend::CpuParallel {

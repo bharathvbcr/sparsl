@@ -66,6 +66,10 @@ objc2-metal = { version = "0.3", optional = true, features = [
 proptest = "1"
 
 [[example]]
+name = "scan_crossover"
+required-features = ["metal"]
+
+[[example]]
 name = "crossover"
 required-features = ["metal"]
 

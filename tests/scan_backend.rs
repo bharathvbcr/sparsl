@@ -8,7 +8,9 @@
 
 mod common;
 
-use sparsl::{assoc_scan_sequential, available_backends, Backend, Device, Rng, State};
+use sparsl::{
+    assoc_scan_sequential, available_backends, tolerance_for_scan, Backend, Device, Rng, State,
+};
 
 fn devices() -> Vec<Device> {
     available_backends()
@@ -95,10 +97,12 @@ fn every_backend_agrees_with_an_f64_reference_within_a_derived_bound() {
                 want.push((ca, cb));
             }
 
-            // Each prefix is a chain of at most `n` multiply-adds. Both arms
-            // reassociate differently; the bound is the usual recursive one,
-            // scaled by the largest intermediate the chain reaches.
-            let bound = 8.0 * f64::from(f32::EPSILON) * n as f64 * max_b.max(1.0);
+            // The crate's own bound, not a copy of it. This used to be the
+            // formula written out here; a caller comparing two backends could
+            // not reach it, and a test carrying its own copy is free to drift
+            // from what the library promises. `tolerance_for_scan` is now
+            // public and this asserts against exactly what it returns.
+            let bound = f64::from(tolerance_for_scan(n, max_b as f32));
             for i in 0..n {
                 assert!(
                     (got[i].a as f64 - want[i].0).abs() <= bound,
