@@ -1,4 +1,4 @@
-//! Seeded ChaCha RNG (U01).
+//! Seeded ChaCha RNG.
 
 use rand::RngCore;
 use rand::SeedableRng;
@@ -7,7 +7,7 @@ use rand_chacha::ChaCha12Rng;
 /// Deterministic ChaCha12 random stream.
 ///
 /// Constructed from a `u64` seed; identical seeds always yield identical
-/// byte/integer sequences (GC3).
+/// byte/integer sequences.
 #[derive(Clone, Debug)]
 pub struct Rng {
     inner: ChaCha12Rng,

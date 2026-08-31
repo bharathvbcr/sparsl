@@ -1,4 +1,4 @@
-//! SIMD cell math (U02).
+//! SIMD cell math.
 //!
 //! Elementwise leak/integrate over SoA columns. The hot path is structured as
 //! fixed-width lanes (`LANES = 8`) so LLVM can autovectorize; a scalar tail
@@ -15,9 +15,10 @@ use crate::time::Tick;
 /// "256-bit" reading of this constant is an x86/AVX assumption and does not
 /// describe the generated code here.
 ///
-/// Before changing this value, re-run `cargo bench -p binn-core
-/// --bench simd_leak_integrate`; the correct width is an empirical question,
-/// not a derivation from the register file.
+/// The correct width is an empirical question, not a derivation from the
+/// register file — and this crate ships no benchmark that answers it. Measure
+/// on your target before changing it rather than reasoning from the register
+/// width, which is what produced the wrong "256-bit" reading above.
 pub const LANES: usize = 8;
 
 /// One Euler step of the linear sub-threshold LIF dynamics

@@ -1,4 +1,4 @@
-//! Sparse CSR connectivity storage (U01).
+//! Sparse CSR connectivity storage.
 
 /// Error returned when CSR parts fail structural validation.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,4 +1,4 @@
-//! Structure-of-arrays typed column buffers (U01).
+//! Structure-of-arrays typed column buffers.
 
 use core::ops::{Deref, DerefMut, Index, IndexMut};
 

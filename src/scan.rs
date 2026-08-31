@@ -1,6 +1,6 @@
-//! Chunked associative scan (U03).
+//! Chunked associative scan over affine maps.
 //!
-//! # Spike reset is a sequential barrier (v7 F1)
+//! # Spike reset is a sequential barrier
 //!
 //! This primitive parallelizes the **linear sub-threshold** membrane recurrence
 //! only. A hard spike **reset is a sequential, data-dependent barrier**: it
@@ -76,7 +76,7 @@ impl State {
 /// # Spike reset barrier
 ///
 /// **Spike reset is a sequential barrier.** This scan does **not** parallelize
-/// across reset events (v7 F1). Only linear sub-threshold segments are valid
+/// across reset events. Only linear sub-threshold segments are valid
 /// inputs; callers must split on resets and scan each chunk independently.
 pub fn assoc_scan<F>(xs: &[State], combine: F) -> Vec<State>
 where
