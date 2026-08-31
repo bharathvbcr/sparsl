@@ -8,6 +8,20 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ### Added
 
+- **Bitpacked spike vectors.** `SparseOp::spmv_spikes` takes 32 spikes per
+  `u32`; `crate::spikes` packs and unpacks them, and `fused_spmv_lif` output
+  feeds straight in. The gathered operand shrinks 32x, and unlike narrow
+  weights the win *grows* with `n` — 0.90-1.07x at 10,000 cells where the f32
+  vector already fits in cache, **1.30-1.48x at 50,000** where it does not.
+  That also explains the narrow-weight result: halving the weights moved
+  streamed traffic, and the gather it left alone is where the cost was.
+- The spike path is **exact**, so there is no tolerance for it. A spike is 0 or
+  1, both exact in f32, and both paths decode the bit and multiply — so it is
+  bit-identical to the dense one, and bit-identical *across backends*, which
+  the dense SpMV is not. Metal's `fma` contraction cannot bite when the
+  multiplier is exactly 0 or 1, because the product has no intermediate
+  rounding to skip.
+
 - **bfloat16 weight storage**, alongside binary16. `Device::prepare_bf16`, or
   `Device::prepare_with` when the format is a variable. The two are
   indistinguishable in speed — both store 2 bytes — so the choice is numerical:

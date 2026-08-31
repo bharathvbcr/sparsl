@@ -1244,6 +1244,48 @@ impl SparseOp {
         }
     }
 
+    /// `y += A · s`, where `s` is a bitpacked spike vector.
+    ///
+    /// The operand an SNN actually has. A spike is a boolean, and carrying it
+    /// as `f32` spends 32 bits to say one — but the saving is not in the bytes
+    /// streamed. `s[col[i]]` is a *random* gather, and its cost is set by
+    /// whether the vector fits in cache: at 50,000 cells this is 6.25 KB
+    /// against 200 KB. That is the operand narrowing the weights did not touch.
+    ///
+    /// Pack with [`crate::spikes::pack_spikes`], which is what
+    /// [`SparseOp::fused_spmv_lif`] output feeds into.
+    ///
+    /// # Exact, not approximate
+    ///
+    /// This is bit-identical to calling [`SparseOp::spmv`] with the same spikes
+    /// expanded to `0.0`/`1.0`, on every backend. Both paths decode the bit to
+    /// a float and multiply, so they perform the same operations in the same
+    /// order. Unlike [`Device::prepare_f16`] there is no tolerance here,
+    /// because there is no approximation — see [`crate::spikes`].
+    pub fn spmv_spikes(&self, spikes: &[u32], y: &mut [f32]) -> Result<(), OpError> {
+        let words = crate::spikes::packed_len(self.shape.ncols());
+        require_min_len("spikes", spikes.len(), words)?;
+        require_len("y", y.len(), self.shape.nrows())?;
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu { csr, weights, .. } => {
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_spmv_spikes_parallel(csr, weights, spikes, y);
+                } else {
+                    cpu_spmv_spikes_sequential(csr, weights, spikes, y);
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => {
+                op.spmv_spikes(spikes, y);
+                Ok(())
+            }
+        }
+    }
+
     /// `y += Aᵀ · x`, using the values this operator holds.
     ///
     /// The reverse of [`SparseOp::spmv`]: `x` has one entry per **row** and `y`
@@ -1598,6 +1640,42 @@ fn cpu_spmm_parallel(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, y: &mu
         .for_each(|(r, row_out)| {
             row_dot_batched(csr, weights, x, n_vec, r, row_out);
         });
+}
+
+/// One row of `A · s` for a bitpacked spike vector.
+///
+/// Deliberately the same shape as [`row_dot`]: decode the bit to `0.0`/`1.0`
+/// and multiply, rather than branching on it. That keeps the operations and
+/// their order identical to the dense path, so the two agree bit for bit
+/// instead of within a tolerance — and it is why there is no
+/// `tolerance_for_spmv_spikes`.
+#[inline]
+fn row_dot_spikes(csr: &Csr, weights: &[f32], spikes: &[u32], r: usize) -> f32 {
+    let start = csr.row_ptr[r] as usize;
+    let end = csr.row_ptr[r + 1] as usize;
+    let mut sum = 0.0f32;
+    // Zipped rather than index-walked, but still strictly in index order: the
+    // bit-identity claim against the dense path is a claim about summation
+    // order, so this may not be reassociated or reordered.
+    for (w, &col) in weights[start..end].iter().zip(&csr.col[start..end]) {
+        let c = col as usize;
+        let bit = (spikes[c / 32] >> (c % 32)) & 1;
+        sum += w * bit as f32;
+    }
+    sum
+}
+
+fn cpu_spmv_spikes_sequential(csr: &Csr, weights: &[f32], spikes: &[u32], y: &mut [f32]) {
+    for (r, y_val) in y.iter_mut().enumerate() {
+        *y_val += row_dot_spikes(csr, weights, spikes, r);
+    }
+}
+
+fn cpu_spmv_spikes_parallel(csr: &Csr, weights: &[f32], spikes: &[u32], y: &mut [f32]) {
+    use rayon::prelude::*;
+    y.par_iter_mut().enumerate().for_each(|(r, y_val)| {
+        *y_val += row_dot_spikes(csr, weights, spikes, r);
+    });
 }
 
 fn cpu_spmv_sequential(csr: &Csr, weights: &[f32], x: &[f32], y: &mut [f32]) {

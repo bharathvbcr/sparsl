@@ -32,6 +32,7 @@ pub mod rng;
 pub mod scan;
 pub mod simd;
 pub mod sparse;
+pub mod spikes;
 pub mod time;
 
 pub use backend::{

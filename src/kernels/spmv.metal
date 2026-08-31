@@ -91,6 +91,43 @@ kernel void csr_spmv_bf16_kernel(
     y[id] += sum;
 }
 
+/// y += A * s, where `s` is a bitpacked spike vector: 32 spikes per word,
+/// least-significant bit first.
+///
+/// The multiply is kept rather than branched away. `float(bit)` is exactly 0.0
+/// or 1.0, so `values[i] * float(bit)` performs the same multiply-add the dense
+/// kernel does, in the same order — the results are bit-identical, not merely
+/// within a tolerance. Branching on the bit would skip the `+= 0.0` and change
+/// the sign of a zero row, and would diverge across a simdgroup besides.
+///
+/// The gain is not in this arithmetic. It is that `s` is 32x smaller than the
+/// f32 vector it replaces, and `s[col_ind[i]]` is a *random* read whose cost is
+/// set by whether the vector fits in cache. At 50,000 cells that is 6.25 KB
+/// against 200 KB.
+kernel void csr_spmv_spikes_kernel(
+    device const uint*  row_ptr [[buffer(0)]],
+    device const uint*  col_ind [[buffer(1)]],
+    device const float* values  [[buffer(2)]],
+    device const uint*  spikes  [[buffer(3)]],
+    device float*       y       [[buffer(4)]],
+    constant uint&      n_rows  [[buffer(5)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= n_rows) { return; }
+    uint row_start = row_ptr[id];
+    uint row_end   = row_ptr[id + 1];
+    float sum = 0.0f;
+    for (uint i = row_start; i < row_end; ++i) {
+        uint c = col_ind[i];
+        // `c` is in range by construction — `SparseOp::prepare` validated every
+        // column against `ncols` before upload, exactly as for the dense
+        // kernels — so `c >> 5` is inside the packed vector.
+        uint bit = (spikes[c >> 5u] >> (c & 31u)) & 1u;
+        sum += values[i] * float(bit);
+    }
+    y[id] += sum;
+}
+
 /// LIF membrane decay, threshold, spike, reset and adaptive threshold bump.
 kernel void lif_integrate_kernel(
     device float*       v           [[buffer(0)]],

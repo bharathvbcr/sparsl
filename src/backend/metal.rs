@@ -127,6 +127,7 @@ pub struct MetalDevice {
     spmv: ComputePipelineState,
     spmv_f16: ComputePipelineState,
     spmv_bf16: ComputePipelineState,
+    spmv_spikes: ComputePipelineState,
     spmv_t: ComputePipelineState,
     spmm: ComputePipelineState,
     scan_chunk: ComputePipelineState,
@@ -212,6 +213,7 @@ impl MetalDevice {
         let spmv = pipeline("csr_spmv_kernel")?;
         let spmv_f16 = pipeline("csr_spmv_f16_kernel")?;
         let spmv_bf16 = pipeline("csr_spmv_bf16_kernel")?;
+        let spmv_spikes = pipeline("csr_spmv_spikes_kernel")?;
         let spmv_t = pipeline("csc_spmv_t_kernel")?;
         let spmm = pipeline("csr_spmm_kernel")?;
         let scan_chunk = pipeline("scan_chunk")?;
@@ -257,6 +259,7 @@ impl MetalDevice {
             spmv,
             spmv_f16,
             spmv_bf16,
+            spmv_spikes,
             spmv_t,
             spmm,
             scan_chunk,
@@ -383,6 +386,7 @@ impl MetalDevice {
         };
         let scratch = Scratch {
             x: self.alloc::<f32>(shape.ncols, "x")?,
+            x_spikes: self.alloc::<u32>(crate::spikes::packed_len(shape.ncols), "x_spikes")?,
             y: self.alloc_guarded::<f32>(shape.nrows, "y")?,
             // Allocated only alongside the reverse index, so a forward-only
             // operator pays neither the index nor the scratch.
@@ -617,6 +621,9 @@ impl Guarded {
 /// writes carries one.
 struct Scratch {
     x: Buffer,
+    /// Packed spike vector, `packed_len(ncols)` words. Allocated with the rest
+    /// so the spike path costs no per-call allocation either.
+    x_spikes: Buffer,
     y: Guarded,
     /// Transposed output, `ncols` long. Separate from `y` because the two
     /// directions have different lengths and a shared buffer sized for the
@@ -821,6 +828,42 @@ impl MetalSparse {
     /// The storage this operator's weights occupy.
     pub fn weight_precision(&self) -> super::WeightPrecision {
         self.precision
+    }
+
+    /// `y += A · s` for a bitpacked spike vector. Lengths checked by the caller.
+    pub fn spmv_spikes(&self, spikes: &[u32], y: &mut [f32]) {
+        let scratch = self.scratch.lock().expect("sparsl scratch mutex poisoned");
+        let words = crate::spikes::packed_len(self.shape.ncols);
+        write_from(&scratch.x_spikes, &spikes[..words]);
+        scratch.y.write(y);
+
+        let tg = self.device.threadgroup_for(&self.device.spmv_spikes);
+        let cb = self
+            .device
+            .queue
+            .commandBuffer()
+            .expect("Metal returned no command buffer");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("Metal returned no compute encoder");
+        enc.setComputePipelineState(&self.device.spmv_spikes);
+        set_buf(&enc, 0, &self.row_ptr);
+        set_buf(&enc, 1, &self.col);
+        // Deliberately `values`, never `values_narrow`: the spike path is
+        // bit-identical to the dense one, and reading quantised weights here
+        // would quietly make that false.
+        set_buf(&enc, 2, &self.values);
+        set_buf(&enc, 3, &scratch.x_spikes);
+        set_buf(&enc, 4, &scratch.y.buffer);
+        set_u32(&enc, 5, self.shape.nrows as u32);
+        enc.dispatchThreads_threadsPerThreadgroup(size(self.shape.nrows), size(tg));
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+
+        scratch.y.assert_intact();
+        read_into(&scratch.y.buffer, y);
+        drop(scratch);
     }
 
     /// Whether this operator carries a reverse index.

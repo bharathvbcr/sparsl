@@ -340,6 +340,24 @@ Second, even 1.33x is not reached, and the likely reason is the term neither fig
 
 So narrow storage is worth a few percent here, not a doubling. It ships because the derivation it forced — [`tolerance_for_spmv_narrow`](src/backend/mod.rs) — is what was actually blocking narrow types, and it is one formula parameterised by the format's epsilon rather than one per format.
 
+### bitpacked spikes: the operand that was actually worth narrowing
+
+`cargo run --release --features metal --example spike_crossover` — `SparseOp::spmv_spikes` takes 32 spikes per `u32` instead of one `f32` each. Three runs, both orders, averaged over 20 dispatches:
+
+| n | `x` dense | `x` packed | dense | packed | speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 39 KB | 1.2 KB | 0.46–0.52 ms | 0.48–0.51 ms | 0.90–1.07x |
+| 20,000 | 78 KB | 2.4 KB | 1.28–1.33 ms | 1.15–1.25 ms | 1.04–1.11x |
+| 50,000 | 195 KB | 6.1 KB | 1.60–1.67 ms | 1.13–1.26 ms | **1.30–1.48x** |
+
+The win *grows* with `n`, which is the whole point and the opposite of a fixed saving. `x[col[i]]` is a random gather, so its cost is set by whether the vector fits in cache rather than by how much of it is streamed. At 39 KB the f32 vector already fits and packing only adds decode work — hence the sub-1.0x readings. At 195 KB it does not, and packing takes it to 6.1 KB.
+
+This is also the measurement that explains the narrow-weight result above. Halving the weights moved streamed traffic and bought a few percent; the gather it left untouched is where the remaining cost was.
+
+**Exact, not approximate.** Unlike narrow weights there is no tolerance here, and none is needed. A spike is 0 or 1, both exact in `f32`, and both paths decode the bit to a float and multiply — so `spmv_spikes` is bit-identical to `spmv` with the same spikes expanded. It is bit-identical *across backends* too, which the dense SpMV is not: the CPU/GPU gap there comes partly from Metal contracting `a*b + c` into one `fma`, and with a multiplier of exactly 0 or 1 the product is exact, so there is no intermediate rounding for contraction to skip.
+
+---
+
 #### Which narrow format
 
 | | binary16 | bfloat16 |
@@ -406,11 +424,10 @@ Re-verification after the fixes: every former survivor is now caught.
 
 ## 🧭 Known gaps
 
-Recorded rather than implied. Everything the crate *contains* is wired, tested and documented; these are capabilities it does not have yet. **SpMM shipped** — see [The batched product](#the-batched-product). The **`block 0.1.6`** entry is gone too: the Metal backend now uses `objc2-metal`, which does not depend on it, so the future-incompatibility lint that would have become a hard error no longer applies.
+Recorded rather than implied. One entry left, and it is a decision rather than a shortfall. **SpMM shipped** — see [The batched product](#the-batched-product). The **`block 0.1.6`** entry is gone too: the Metal backend now uses `objc2-metal`, which does not depend on it, so the future-incompatibility lint that would have become a hard error no longer applies.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
-| **bitpacked spikes** | A spike is one *bit*, not 32. Narrow *weights* are done; this is the other axis, and the one with real headroom — 32x on the input side rather than the 25% that halving the weights moves. | Needs a different kernel, not a different tolerance: the operand stops being a float, so the error analysis that unblocked binary16 and bfloat16 does not carry over. |
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
 
 ---
