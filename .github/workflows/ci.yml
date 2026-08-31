@@ -84,13 +84,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --features metal --all-targets -- -D warnings
       - run: cargo build --features metal --all-targets --release
-      - name: Confirm this runner really has no Metal device
-        # If this ever starts finding a device, hosted runners gained Metal and
-        # the `metal-gpu` job below can move off self-hosted. Informational: it
-        # must never fail the build.
+      - name: Report whether this runner has a Metal device
+        # Must carry `--features metal`, or this probes the cargo feature rather
+        # than the hardware and reports "built without the metal feature" no
+        # matter what the runner has — which is what the first run of this
+        # workflow did.
+        #
+        # Informational only. If it ever starts reporting "ran on Metal GPU",
+        # hosted runners gained a Metal device and the `metal-gpu` job below can
+        # come off self-hosted.
         continue-on-error: true
-        run: |
-          cargo run --release --example readme || true
+        run: cargo run --release --features metal --example readme
 
   # ---------------------------------------------------------------------------
   # The real GPU arm. Requires a self-hosted Apple silicon runner.
