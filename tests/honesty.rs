@@ -134,7 +134,11 @@ fn cpu_parallel_is_bit_identical_to_sequential() {
         op_par
             .fused_spmv_lif(&x, &mut v_p, &mut th_p, &mut sp_p, params)
             .expect("fused");
-        assert_eq!(v_s.to_bits_vec(), v_p.to_bits_vec(), "fused v (nrows={nrows})");
+        assert_eq!(
+            v_s.to_bits_vec(),
+            v_p.to_bits_vec(),
+            "fused v (nrows={nrows})"
+        );
         assert_eq!(th_s.to_bits_vec(), th_p.to_bits_vec(), "fused theta");
         assert_eq!(sp_s, sp_p, "fused spikes");
 

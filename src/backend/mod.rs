@@ -240,11 +240,7 @@ pub enum SparsePlanError {
     /// On CPU this would be a bounds panic. On GPU it is an out-of-bounds read
     /// of arbitrary device memory, which is why it is rejected before upload
     /// rather than checked per non-zero inside the kernel.
-    ColumnOutOfRange {
-        edge: usize,
-        col: u32,
-        ncols: usize,
-    },
+    ColumnOutOfRange { edge: usize, col: u32, ncols: usize },
     /// The shape does not fit the `u32` indices the GPU kernels use.
     TooLarge { what: &'static str, value: usize },
     /// `weights` did not have one entry per stored non-zero.
@@ -262,13 +258,19 @@ impl fmt::Display for SparsePlanError {
             Self::NnzMismatch {
                 row_ptr_end,
                 col_len,
-            } => write!(f, "CSR row_ptr end ({row_ptr_end}) != col.len() ({col_len})"),
+            } => write!(
+                f,
+                "CSR row_ptr end ({row_ptr_end}) != col.len() ({col_len})"
+            ),
             Self::ColumnOutOfRange { edge, col, ncols } => write!(
                 f,
                 "CSR column index {col} at edge {edge} is out of range (ncols = {ncols})"
             ),
             Self::TooLarge { what, value } => {
-                write!(f, "{what} = {value} exceeds the u32 index range of the GPU kernels")
+                write!(
+                    f,
+                    "{what} = {value} exceeds the u32 index range of the GPU kernels"
+                )
             }
             Self::WeightsLen { expected, got } => write!(
                 f,
@@ -625,7 +627,10 @@ impl Device {
 
 #[allow(clippy::large_enum_variant)]
 enum OpResident {
-    Cpu { csr: Csr, weights: Vec<f32> },
+    Cpu {
+        csr: Csr,
+        weights: Vec<f32>,
+    },
     #[cfg(all(target_os = "macos", feature = "metal"))]
     Metal(metal::MetalSparse),
 }
@@ -698,7 +703,9 @@ impl SparseOp {
     pub fn set_weights(&mut self, weights: &[f32]) -> Result<(), OpError> {
         require_len("weights", weights.len(), self.shape.nnz)?;
         match &mut self.resident {
-            OpResident::Cpu { weights: stored, .. } => {
+            OpResident::Cpu {
+                weights: stored, ..
+            } => {
                 stored.clear();
                 stored.extend_from_slice(weights);
             }

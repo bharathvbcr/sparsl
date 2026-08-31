@@ -29,7 +29,10 @@ fn metal_membrane_matches_one_of_the_two_roundings() {
     let mut rng = Rng::new(0x0FA0_9403);
     let n = 4096;
     let v0 = random_vec(n, 1.0, &mut rng);
-    let theta0: Vec<f32> = random_vec(n, 0.5, &mut rng).iter().map(|t| t.abs()).collect();
+    let theta0: Vec<f32> = random_vec(n, 0.5, &mut rng)
+        .iter()
+        .map(|t| t.abs())
+        .collect();
     let currents = random_vec(n, 1.0, &mut rng);
 
     let (mut v_gpu, mut th_gpu, mut sp_gpu) = (v0.clone(), theta0.clone(), vec![false; n]);

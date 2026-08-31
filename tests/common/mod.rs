@@ -25,7 +25,9 @@ pub fn random_csr(nrows: usize, ncols: usize, max_deg: usize, rng: &mut Rng) -> 
 
 /// Uniform values in `[-scale, scale)`.
 pub fn random_vec(n: usize, scale: f32, rng: &mut Rng) -> Vec<f32> {
-    (0..n).map(|_| (rng.next_f32() * 2.0 - 1.0) * scale).collect()
+    (0..n)
+        .map(|_| (rng.next_f32() * 2.0 - 1.0) * scale)
+        .collect()
 }
 
 /// The largest `|weight * x|` any row sum can contain. Feeds the error bound.

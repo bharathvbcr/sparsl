@@ -66,10 +66,12 @@ fn out_of_range_columns_never_reach_a_device() {
     for backend in sparsl::available_backends() {
         let device = Device::try_new(backend).expect("available");
         for (name, csr, ncols) in cases {
-            let err = device.prepare(csr, *ncols, &vec![1.0f32; csr.nnz()]).expect_err(&format!(
-                "{}: `{name}` must be rejected before upload",
-                backend.label()
-            ));
+            let err = device
+                .prepare(csr, *ncols, &vec![1.0f32; csr.nnz()])
+                .expect_err(&format!(
+                    "{}: `{name}` must be rejected before upload",
+                    backend.label()
+                ));
             match err {
                 SparsePlanError::ColumnOutOfRange { col, ncols: n, .. } => {
                     assert!(
@@ -78,7 +80,10 @@ fn out_of_range_columns_never_reach_a_device() {
                         backend.label()
                     );
                 }
-                other => panic!("{}: `{name}` gave {other:?}, expected ColumnOutOfRange", backend.label()),
+                other => panic!(
+                    "{}: `{name}` gave {other:?}, expected ColumnOutOfRange",
+                    backend.label()
+                ),
             }
         }
     }
@@ -164,23 +169,38 @@ fn mismatched_operand_lengths_are_reported_not_asserted() {
         let label = backend.label();
 
         // Weights are validated where they are now supplied: at prepare.
-        assert!(matches!(
-            device.prepare(&csr, ncols, &vec![1.0; nnz + 1]),
-            Err(SparsePlanError::WeightsLen { .. })
-        ), "{label}: long weights must be rejected at prepare");
+        assert!(
+            matches!(
+                device.prepare(&csr, ncols, &vec![1.0; nnz + 1]),
+                Err(SparsePlanError::WeightsLen { .. })
+            ),
+            "{label}: long weights must be rejected at prepare"
+        );
         let mut op_mut = device.prepare(&csr, ncols, &weights).expect("valid");
-        assert!(matches!(
-            op_mut.set_weights(&vec![1.0; nnz + 1]),
-            Err(OpError::Length { what: "weights", .. })
-        ), "{label}: set_weights must reject a wrong length");
-        assert!(matches!(
-            op.spmv(&vec![1.0; ncols - 1], &mut y),
-            Err(OpError::TooShort { what: "x", .. })
-        ), "{label}: short x");
-        assert!(matches!(
-            op.spmv(&x, &mut vec![0.0; nrows + 3]),
-            Err(OpError::Length { what: "y", .. })
-        ), "{label}: wrong y");
+        assert!(
+            matches!(
+                op_mut.set_weights(&vec![1.0; nnz + 1]),
+                Err(OpError::Length {
+                    what: "weights",
+                    ..
+                })
+            ),
+            "{label}: set_weights must reject a wrong length"
+        );
+        assert!(
+            matches!(
+                op.spmv(&vec![1.0; ncols - 1], &mut y),
+                Err(OpError::TooShort { what: "x", .. })
+            ),
+            "{label}: short x"
+        );
+        assert!(
+            matches!(
+                op.spmv(&x, &mut vec![0.0; nrows + 3]),
+                Err(OpError::Length { what: "y", .. })
+            ),
+            "{label}: wrong y"
+        );
 
         // A longer-than-required `x` is legal: only the first `ncols` are read.
         let long_x = {
@@ -202,14 +222,29 @@ fn mismatched_operand_lengths_are_reported_not_asserted() {
         let mut v = vec![0.0f32; nrows];
         let mut theta = vec![1.0f32; nrows];
         let mut spikes = vec![false; nrows];
-        assert!(matches!(
-            op.fused_spmv_lif(&x, &mut v, &mut vec![1.0; nrows - 1], &mut spikes, params),
-            Err(OpError::Length { what: "theta", .. })
-        ), "{label}: short theta");
-        assert!(matches!(
-            device.lif_integrate(&mut v, &mut theta, &vec![0.0; nrows + 1], &mut spikes, params),
-            Err(OpError::Length { what: "currents", .. })
-        ), "{label}: wrong currents");
+        assert!(
+            matches!(
+                op.fused_spmv_lif(&x, &mut v, &mut vec![1.0; nrows - 1], &mut spikes, params),
+                Err(OpError::Length { what: "theta", .. })
+            ),
+            "{label}: short theta"
+        );
+        assert!(
+            matches!(
+                device.lif_integrate(
+                    &mut v,
+                    &mut theta,
+                    &vec![0.0; nrows + 1],
+                    &mut spikes,
+                    params
+                ),
+                Err(OpError::Length {
+                    what: "currents",
+                    ..
+                })
+            ),
+            "{label}: wrong currents"
+        );
     }
 }
 
@@ -250,7 +285,11 @@ fn non_finite_data_propagates_without_crashing() {
         let device = Device::try_new(backend).expect("available");
         let nnz = csr.nnz();
 
-        for (name, poison) in [("nan", f32::NAN), ("inf", f32::INFINITY), ("-inf", f32::NEG_INFINITY)] {
+        for (name, poison) in [
+            ("nan", f32::NAN),
+            ("inf", f32::INFINITY),
+            ("-inf", f32::NEG_INFINITY),
+        ] {
             let mut weights = vec![0.5f32; nnz];
             if !weights.is_empty() {
                 weights[nnz / 2] = poison;
@@ -328,7 +367,9 @@ fn degenerate_shapes_are_no_ops_not_crashes() {
             .expect("zero-row fused");
 
         // Rows but no edges.
-        let op = device.prepare(&Csr::empty(8), 4, &[]).expect("edgeless CSR");
+        let op = device
+            .prepare(&Csr::empty(8), 4, &[])
+            .expect("edgeless CSR");
         assert_eq!(op.shape().nnz, 0);
         let mut y = vec![7.0f32; 8];
         op.spmv(&[1.0; 4], &mut y).expect("edgeless spmv");

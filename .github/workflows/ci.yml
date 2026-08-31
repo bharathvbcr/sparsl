@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CPU arms. These are the whole suite minus the Metal backend, and they are
+  # not a reduced-value fallback: `available_backends()` simply returns fewer
+  # arms, and every differential, stress, honesty and golden test runs against
+  # the ones that remain.
+  #
+  # Linux is not here for portability box-ticking. `Backend::Metal` reports
+  # itself unavailable on Linux, which means `try_new` takes its refusal path —
+  # the exact branch that cannot be executed on a machine that has Metal, and
+  # that a mutation campaign showed no test on such a machine can cover. This
+  # job closes that gap.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (release)
+        # Release, because the stress suite's soak and long-row cases are
+        # impractically slow unoptimised.
+        run: cargo test --release --all-targets
+      - name: Doc tests
+        # `--all-targets` silently excludes doc tests. Running them separately
+        # is the only way they execute at all.
+        run: cargo test --release --doc
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Metal: compiled and linted, deliberately NOT tested.
+  #
+  # GitHub-hosted macOS runners do not expose a Metal device. `cargo test
+  # --features metal` would therefore fail here — and it would fail *correctly*,
+  # because `differential.rs::the_suite_actually_has_something_to_test` asserts
+  # that a build carrying the `metal` feature on macOS must find Metal
+  # available. That assertion exists so a suite cannot silently pass while
+  # testing nothing, and it is doing its job. Do not "fix" a red run by
+  # deleting that test or by dropping the feature flag from it.
+  #
+  # So this job typechecks and lints the Metal backend, and the GPU job below
+  # actually runs it.
+  # ---------------------------------------------------------------------------
+  metal-build:
+    name: metal / typecheck only (no GPU on hosted runners)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --features metal --all-targets -- -D warnings
+      - run: cargo build --features metal --all-targets --release
+      - name: Confirm this runner really has no Metal device
+        # If this ever starts finding a device, hosted runners gained Metal and
+        # the `metal-gpu` job below can move off self-hosted. Informational: it
+        # must never fail the build.
+        continue-on-error: true
+        run: |
+          cargo run --release --example readme || true
+
+  # ---------------------------------------------------------------------------
+  # The real GPU arm. Requires a self-hosted Apple silicon runner.
+  #
+  # Gated on a repository variable rather than merely targeting `self-hosted`,
+  # because a job whose runner label matches nothing queues indefinitely instead
+  # of skipping. Set `HAS_METAL_RUNNER` to `true` in
+  # Settings → Secrets and variables → Actions → Variables once a runner is
+  # registered with the labels below.
+  # ---------------------------------------------------------------------------
+  metal-gpu:
+    name: metal / full suite on a real GPU
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Full suite with Metal
+        run: cargo test --features metal --release --all-targets
+      - name: Crossover measurement
+        # Not a gate — the numbers land in the job log so a regression in the
+        # CPU/GPU crossover is visible without anyone running it by hand.
+        run: cargo run --release --features metal --example crossover
+
+  # ---------------------------------------------------------------------------
+  # Cargo.toml claims `rust-version = "1.82"`. Unverified, that is just a string
+  # in a manifest, so this builds against exactly that toolchain.
+  #
+  # Two deliberate flags, both load-bearing:
+  #
+  # `--locked` — without it, Cargo 1.82 re-resolves and pulls a `getrandom` that
+  # needs `edition2024`, failing on a dependency rather than on this crate. The
+  # MSRV claim is about building the shipped lockfile, so the lockfile is what
+  # gets built.
+  #
+  # NOT `--all-targets` — that pulls dev-dependencies, and `proptest` declares
+  # `rust-version = 1.85`. The test suite genuinely needs a newer toolchain than
+  # the library does. `rust-version` is a promise to consumers of the library,
+  # who never build the tests, so this checks what the promise actually covers.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV 1.82 (library)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      - run: cargo check --locked --features metal

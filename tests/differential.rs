@@ -84,10 +84,8 @@ fn spmv_accumulates_rather_than_overwrites() {
 
         let op_ref = reference.prepare(&csr, ncols, &weights).expect("valid");
         let op = device.prepare(&csr, ncols, &weights).expect("valid");
-        let tol = tolerance_for_nnz_per_row(
-            op.shape().nnz_per_row() * 2,
-            max_abs_term(&weights, &x),
-        );
+        let tol =
+            tolerance_for_nnz_per_row(op.shape().nnz_per_row() * 2, max_abs_term(&weights, &x));
 
         let mut y_ref = y0.clone();
         let mut y_got = y0;
@@ -122,7 +120,10 @@ fn fused_spmv_lif_matches_reference_across_shapes() {
             // fraction of cells actually spike. Parameters that never fire
             // would leave the reset and threshold-bump branches untested.
             let v0 = random_vec(nrows, 0.5, &mut rng);
-            let theta0: Vec<f32> = random_vec(nrows, 0.5, &mut rng).iter().map(|t| t.abs()).collect();
+            let theta0: Vec<f32> = random_vec(nrows, 0.5, &mut rng)
+                .iter()
+                .map(|t| t.abs())
+                .collect();
 
             let op_ref = reference.prepare(&csr, ncols, &weights).expect("valid");
             let op = device.prepare(&csr, ncols, &weights).expect("valid");
@@ -190,7 +191,10 @@ fn lif_integrate_matches_reference() {
 
         for &n in &[0usize, 1, 31, 32, 33, 255, 256, 257, 4096] {
             let v0 = random_vec(n, 1.0, &mut rng);
-            let theta0: Vec<f32> = random_vec(n, 0.5, &mut rng).iter().map(|t| t.abs()).collect();
+            let theta0: Vec<f32> = random_vec(n, 0.5, &mut rng)
+                .iter()
+                .map(|t| t.abs())
+                .collect();
             let currents = random_vec(n, 1.0, &mut rng);
 
             let (mut v_ref, mut th_ref, mut sp_ref) = (v0.clone(), theta0.clone(), vec![false; n]);

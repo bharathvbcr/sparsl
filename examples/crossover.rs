@@ -57,17 +57,22 @@ fn ms(total: Duration, iters: usize) -> f64 {
 
 fn main() {
     let arms = available_backends();
-    println!("backends: {}", arms
-        .iter()
-        .map(|b| b.label())
-        .collect::<Vec<_>>()
-        .join(", "));
+    println!(
+        "backends: {}",
+        arms.iter()
+            .map(|b| b.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     for backend in Backend::ALL {
         if let Some(reason) = backend.unavailable_reason() {
             println!("  unavailable — {}: {reason}", backend.label());
         }
     }
-    if let Some(name) = Device::try_new(Backend::Metal).ok().and_then(|d| d.device_name()) {
+    if let Some(name) = Device::try_new(Backend::Metal)
+        .ok()
+        .and_then(|d| d.device_name())
+    {
         println!("  Metal device: {name}");
     }
     println!();
@@ -134,6 +139,9 @@ fn main() {
         for t in &best {
             print!(" {t:.3} |");
         }
-        println!(" {:.2}x | {upload_ms:.3} | {spread:.2} |", reference / fastest);
+        println!(
+            " {:.2}x | {upload_ms:.3} | {spread:.2} |",
+            reference / fastest
+        );
     }
 }
