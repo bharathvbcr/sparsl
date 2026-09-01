@@ -1,4 +1,18 @@
-//! Sparse CSR connectivity storage.
+//! Sparse connectivity in CSR and CSC form, validated on construction.
+//!
+//! [`Csr`] holds the forward graph, [`Csc`] its transpose for `y += Aᵀ·x`.
+//! Both validate structurally when built: monotonic row pointers, and every
+//! column index inside the declared column count.
+//!
+//! That validation is the point rather than a courtesy. An out-of-range column
+//! index reaches the GPU as an out-of-bounds read, which on a GPU is not a
+//! fault but a plausible number gathered from somewhere else in the buffer.
+//! Checking once at construction is cheaper than checking per edge in the
+//! kernel, and it makes the failure a caller error at a line the caller wrote
+//! instead of a wrong answer several dispatches later.
+//!
+//! [`Csc::from_csr_rect`] takes an explicit column count, because a rectangular
+//! operator's transpose cannot infer it from the row count.
 
 /// Error returned when CSR parts fail structural validation.
 #[derive(Clone, Debug, PartialEq, Eq)]

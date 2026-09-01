@@ -1,4 +1,14 @@
-//! Structure-of-arrays typed column buffers.
+//! Structure-of-arrays typed column buffers for cell state.
+//!
+//! One allocation per field rather than one per cell. A membrane-potential
+//! sweep then reads a contiguous `f32` run instead of striding over a struct,
+//! which is what lets the CPU kernels vectorise and what lets the GPU kernels
+//! coalesce their loads.
+//!
+//! The layout is also why the backends can share a reference: an
+//! array-of-structs would put the same numbers in a different order in memory,
+//! and a differential test comparing them would be measuring the layout as much
+//! as the arithmetic.
 
 use core::ops::{Deref, DerefMut, Index, IndexMut};
 

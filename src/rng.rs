@@ -1,4 +1,13 @@
-//! Seeded ChaCha RNG.
+//! Seeded ChaCha random streams.
+//!
+//! ChaCha rather than a faster generator because the stream must be identical
+//! across platforms and across runs: a simulation seeded with the same value has
+//! to produce the same spikes, or none of the bit-reproducibility this crate
+//! claims survives contact with a random input.
+//!
+//! The generated stream is pinned by a golden test. A change to it is a change
+//! to every result anyone has recorded with this crate, so it should take a
+//! failing test to make one.
 
 use rand::RngCore;
 use rand::SeedableRng;
