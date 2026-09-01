@@ -7,7 +7,7 @@ Extracted from the numeric core of a spiking-network research harness. The kerne
 | | |
 | --- | --- |
 | **Status** | `0.1.0` — Metal verified, CUDA declared but unavailable |
-| **Tests** | 56 passing; suite verified by a 20-case mutation campaign |
+| **Tests** | 103 passing with `--features metal`, 101 without; suite verified by a 20-case mutation campaign |
 | **Platform** | Any CPU; Metal on macOS behind `--features metal` |
 | **License** | MIT OR Apache-2.0 |
 
@@ -398,12 +398,19 @@ cargo test --features metal --release
 
 | Suite | Tests | What it holds down |
 | --- | ---: | --- |
-| Unit (in-crate) | 28 | Scan bit-exactness, CSR/CSC invariants, RNG golden stream, tolerance bounds |
-| `honesty` | 6 | Unconstructible unavailable backends, distinct labels, CPU arms bit-identical |
+| Unit (in-crate) | 42 | Scan bit-exactness, CSR/CSC invariants, RNG golden stream, tolerance bounds |
+| `stress` | 14 | Malformed CSR, out-of-range columns, non-finite data, subnormals, contention, soak |
+| `scan_backend` | 8 | The chunked affine scan on every substrate, including exact integer prefixes |
 | `differential` | 6 | Every available backend against the CPU reference, boundary shapes plus a proptest fuzz |
-| `stress` | 13 | Malformed CSR, out-of-range columns, non-finite data, subnormals, contention, soak |
+| `honesty` | 6 | Unconstructible unavailable backends, distinct labels, CPU arms bit-identical |
+| `spmm` | 6 | Multi-vector SpMM against repeated SpMV, including the `n_vec == 1` fast path |
+| `transpose` | 6 | CSC construction and the transposed SpMV, including rectangular operators |
+| `spikes_backend` | 6 | Bitpacked spike vectors against the dense encoding |
+| `narrow_backend` | 5 | `binary16` and `bfloat16` weight storage against `f32` |
 | `golden` | 2 | The reference's own output bits |
-| `fma_contraction` | 1 | That the CPU/GPU gap has exactly one identified cause |
+| `fma_contraction` | 2 | That the CPU/GPU gap has exactly one identified cause |
+
+Counts are with `--features metal`; the two Metal-gated arms drop without it.
 
 The shape sweep straddles every boundary the backends care about — 31, 32, 33 for the SIMD width and 255, 256, 257 for the threadgroup — plus the degenerate zero-row, zero-edge and single-row cases that a sweep of reasonable sizes never reaches.
 
