@@ -143,5 +143,4 @@ why each piece landed.
 - Canary sentinel buffers around every Metal allocation, and a golden output
   fingerprint pinned across releases.
 
-[Unreleased]: https://github.com/bharathvbcr/sparsl
-[0.1.0]: https://github.com/bharathvbcr/sparsl
+[0.1.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.0
