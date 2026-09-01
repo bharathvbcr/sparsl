@@ -1,12 +1,27 @@
 # sparsl
 
+<p align="center">
+  <a href="https://crates.io/crates/sparsl"><img src="https://img.shields.io/crates/v/sparsl.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/sparsl"><img src="https://img.shields.io/docsrs/sparsl" alt="docs.rs"></a>
+  <a href="https://github.com/bharathvbcr/sparsl/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/sparsl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/crates/l/sparsl.svg" alt="MIT OR Apache-2.0">
+</p>
+
+<p align="center">
+  <a href="https://docs.rs/sparsl"><strong>API documentation</strong></a> ·
+  <a href="https://crates.io/crates/sparsl"><strong>crates.io</strong></a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/bharathvbcr/tessl">tessl, the dense counterpart</a>
+</p>
+
 Deterministic sparse and scan compute kernels for event-driven simulation, with fail-closed CPU and GPU backends.
 
 Extracted from the numeric core of a spiking-network research harness. The kernels themselves are small and unglamorous — CSR sparse matrix-vector multiply, a leaky integrate-and-fire membrane update, a chunked prefix scan over affine maps, structure-of-arrays column buffers, a seeded RNG. What the crate is about is the two properties those kernels are held to: **results you can reproduce bit for bit**, and **a backend handle that cannot lie about where it ran**.
 
 | | |
 | --- | --- |
-| **Status** | `0.1.0` — Metal verified, CUDA declared but unavailable |
+| **Status** | [`0.1.1`](https://crates.io/crates/sparsl) — Metal verified, CUDA declared but unavailable |
+| **API docs** | [docs.rs/sparsl](https://docs.rs/sparsl) — built on `aarch64-apple-darwin` with `--features metal`, so the Metal backend is documented rather than cfg'd away |
 | **Tests** | 103 passing with `--features metal`, 101 without; suite verified by a 20-case mutation campaign |
 | **Platform** | Any CPU; Metal on macOS behind `--features metal` |
 | **License** | MIT OR Apache-2.0 |
