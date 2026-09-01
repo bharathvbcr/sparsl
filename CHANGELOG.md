@@ -6,6 +6,21 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`documentation` in `Cargo.toml`, and the published docs linked from the
+  README.** The 0.1.1 docs work landed on a page no GitHub reader was pointed
+  at. The README now carries crates.io, docs.rs, CI and license badges, a nav
+  line to the API docs, the crate page, the changelog and `tessl`, and an
+  `API docs` row recording that the page is built on `aarch64-apple-darwin`
+  with `--features metal` — which is why `Backend::Metal` is documented there
+  rather than `cfg`'d away.
+
+### Fixed
+
+- The README Status row said `0.1.0` while crates.io served `0.1.1`. Corrected,
+  and linked to the crate page.
+
 ## [0.1.1] — 2026-09-01
 
 Documentation only. No code or API changes; the compiled crate is identical to

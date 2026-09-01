@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 description = "Deterministic sparse + scan compute kernels for event-driven simulation, with fail-closed CPU/GPU backends"
 repository = "https://github.com/bharathvbcr/sparsl"
+documentation = "https://docs.rs/sparsl"
 readme = "README.md"
 keywords = ["sparse", "spmv", "simd", "metal", "deterministic"]
 categories = ["science", "algorithms", "hardware-support"]
