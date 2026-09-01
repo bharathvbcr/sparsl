@@ -6,7 +6,27 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.1.1] — 2026-09-01
+
+Documentation only. No code or API changes; the compiled crate is identical to
+0.1.0.
+
+### Added
+
+- **A quickstart on the docs.rs landing page, as a real doctest** rather than a
+  `no_run` sketch — the CPU backend runs anywhere, so it executes on every check
+  and passes with and without `metal`. It shows the try_new-then-fall-back
+  shape deliberately, since that pattern is what the availability gate exists to
+  make possible.
+- A module map, and a feature table that says plainly what `cuda` is: a
+  declaration of intent that provides nothing, with `Backend::Cuda` left
+  unconstructible. Burying that in a feature name would repeat the defect this
+  crate was extracted to prevent.
+- Contributor notes on why the tolerance functions are bounded from above as
+  well as below, why every kernel-written buffer carries a sentinel tail, and
+  why `build.rs` names `spmv.metal` explicitly.
+- Real module docs for `buffer`, `rng`, `sparse` and `time`, which had one line
+  each.
 
 ## [0.1.0] — 2026-08-31
 
