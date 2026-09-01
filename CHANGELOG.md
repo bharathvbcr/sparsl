@@ -4,7 +4,12 @@ All notable changes to `sparsl` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-08-31
+
+First published release. The crate has not been on crates.io before, so
+everything in this file ships in it — the sections below were written while the
+work was unreleased and are kept as-is rather than reflowed, because they record
+why each piece landed.
 
 ### Added
 
@@ -122,11 +127,9 @@ All notable changes to `sparsl` are recorded here. The format follows
   named `SparseOp::prepare`, which exists but is crate-private; the public entry
   point is `Device::prepare`.
 
-## [0.1.0]
+### Initial extraction from BINN's `binn-core`
 
-Initial extraction from BINN's `binn-core`.
-
-### Added
+#### Added
 
 - `Backend` / `Device` with a single availability gate: a handle is only
   constructible for a substrate that can execute, and `Device::label` reports
