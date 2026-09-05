@@ -24,6 +24,70 @@ fn random_spikes(n: usize, density: f32, rng: &mut Rng) -> Vec<bool> {
     (0..n).map(|_| rng.next_f32() < density).collect()
 }
 
+/// A cleared spike must still perform its multiply.
+///
+/// The kernels decode a bit and multiply by `0.0` or `1.0` rather than
+/// branching on it, and every backend's comment says so. Rewriting that as
+/// `if (bit) { acc += w; }` is the obvious optimisation and it is wrong: for a
+/// non-finite weight on a *cleared* column the dense path evaluates
+/// `inf * 0.0` and produces NaN, while the branch skips the term and returns a
+/// finite number. The two paths would then disagree on exactly the inputs a
+/// tolerance cannot rescue.
+///
+/// A mutation campaign found this hole: replacing the multiply with a branch in
+/// the Metal spike kernel passed the entire suite, because every fixture used
+/// finite weights, for which the two forms are genuinely equivalent. `prepare`
+/// validates CSR structure and weight *length* but not finiteness, so the
+/// distinguishing input is reachable through the public API.
+///
+/// Every lane tier is covered because the Metal backend picks its SpMV kernel
+/// from the operator's mean degree: a maximum degree of 4 (mean 2) stays on
+/// the one-lane kernels, 40 (mean 20) selects the eight-lane teams and 160
+/// (mean 80) the simdgroup kernels; the fixtures above are all in the first
+/// group.
+#[test]
+fn a_cleared_spike_still_multiplies_its_weight() {
+    let mut rng = Rng::new(0x5B18);
+    for &(nrows, ncols, deg) in &[(48usize, 64usize, 4usize), (48, 64, 40), (48, 64, 160)] {
+        let csr = random_csr(nrows, ncols, deg, &mut rng);
+        if csr.nnz() == 0 {
+            continue;
+        }
+        for &poison in &[f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut weights = random_vec(csr.nnz(), 1.0, &mut rng);
+            // Put the non-finite weight on the first stored entry, and clear
+            // exactly the column it multiplies.
+            weights[0] = poison;
+            let poisoned_col = csr.col[0] as usize;
+            let spikes: Vec<bool> = (0..ncols).map(|c| c != poisoned_col).collect();
+            let packed = pack_spikes(&spikes);
+            let dense = spikes_to_f32(&packed, ncols);
+
+            for device in devices() {
+                let op = device.prepare(&csr, ncols, &weights).expect("prepare");
+                let mut via_dense = vec![0.0f32; nrows];
+                op.spmv(&dense, &mut via_dense).expect("spmv");
+                let mut via_spikes = vec![0.0f32; nrows];
+                op.spmv_spikes(&packed, &mut via_spikes)
+                    .expect("spmv_spikes");
+
+                for r in 0..nrows {
+                    assert_eq!(
+                        via_dense[r].to_bits(),
+                        via_spikes[r].to_bits(),
+                        "{}: deg={deg} poison={poison:?} row {r}: dense {:?} \
+                         versus packed {:?}; a cleared spike must multiply, not \
+                         branch",
+                        device.label(),
+                        via_dense[r],
+                        via_spikes[r]
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn the_spike_path_is_bit_identical_to_the_dense_one() {
     let mut rng = Rng::new(0x5B17);
@@ -126,9 +190,11 @@ fn every_backend_agrees_with_every_other_exactly() {
 
     // Note this demands *equality* across backends, which the dense SpMV
     // cannot promise — there it takes `tolerance_for_spmv`, because the CPU and
-    // GPU reduce in different orders. It holds here for the same reason it
-    // holds against the dense path: one thread per row on every arm, summing
-    // the same products in index order.
+    // GPU may reduce in different orders. It holds here only because this
+    // shape's mean degree (6) keeps the Metal backend on its one-lane tier,
+    // which sums the same products in index order exactly as the CPU arms do;
+    // the eight- and 32-lane tiers fold a row with a butterfly and would not
+    // match the CPU to the bit. The shape is part of the assertion.
     let mut reference: Option<(String, Vec<f32>)> = None;
     for device in devices() {
         let op = device.prepare(&csr, ncols, &weights).expect("prepare");

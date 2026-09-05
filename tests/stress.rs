@@ -331,19 +331,10 @@ fn non_finite_data_propagates_without_crashing() {
             op.spmv(&x, &mut y_got).expect("got");
 
             for i in 0..nrows {
-                assert_eq!(
-                    y_ref[i].is_finite(),
-                    y_got[i].is_finite(),
-                    "{} row {i} with {name} weight: reference finite={}, backend finite={}",
-                    backend.label(),
-                    y_ref[i].is_finite(),
-                    y_got[i].is_finite()
-                );
-                assert_eq!(
-                    y_ref[i].is_nan(),
-                    y_got[i].is_nan(),
-                    "{} row {i} with {name} weight: NaN-ness must agree",
-                    backend.label()
+                assert_same_numeric_class(
+                    y_got[i],
+                    y_ref[i],
+                    &format!("{} row {i} with {name} weight", backend.label()),
                 );
             }
         }
@@ -445,6 +436,34 @@ fn a_single_very_long_row_is_handled() {
             y_ref[0]
         );
     }
+}
+
+/// The team kernels stride through a line by their lane count. A valid line
+/// may begin within 31 entries of `u32::MAX`; adding the lane or the next
+/// stride in `uint` then wraps to the beginning of the values buffer instead
+/// of ending the loop. The fixture is arithmetic-only because allocating four billion
+/// edges would make the regression test useless; the source assertion pins the
+/// required widening at the device boundary.
+#[test]
+fn fused_metal_indices_widen_before_offset_arithmetic() {
+    let row_start = u32::MAX - 1;
+    let lane = 31u32;
+    assert!(
+        u64::from(row_start) + u64::from(lane) > u64::from(u32::MAX),
+        "fixture must cross the uint boundary"
+    );
+
+    let source = include_str!("../src/kernels/spmv.metal");
+    assert!(
+        source.contains("return (ulong)group_id * (threads_per_group / LPR) + (tid / LPR);"),
+        "line geometry must widen before multiplying and adding"
+    );
+    assert!(
+        source.contains(
+            "for (ulong i = (ulong)line_start + lane; i < (ulong)line_end; i += (ulong)LPR)"
+        ),
+        "line traversal must widen before adding a lane or the team stride"
+    );
 }
 
 // ---------------------------------------------------------------------------

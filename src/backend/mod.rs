@@ -261,6 +261,9 @@ pub enum SparsePlanError {
     WeightsLen { expected: usize, got: usize },
     /// The device rejected an allocation.
     Allocation { what: &'static str },
+    /// The selected substrate became unavailable after the device handle was
+    /// created, so preparing resident state would be unsafe or misleading.
+    Backend { reason: &'static str },
 }
 
 impl fmt::Display for SparsePlanError {
@@ -291,6 +294,7 @@ impl fmt::Display for SparsePlanError {
                 "weights must have one entry per non-zero: expected {expected}, got {got}"
             ),
             Self::Allocation { what } => write!(f, "device allocation failed for {what}"),
+            Self::Backend { reason } => write!(f, "backend refused: {reason}"),
         }
     }
 }
@@ -299,9 +303,10 @@ impl std::error::Error for SparsePlanError {}
 
 /// Why an operation call was rejected.
 ///
-/// Every variant is a caller-data problem, reported rather than asserted, so a
-/// fuzzer or a long-running process gets an error it can handle instead of an
-/// abort.
+/// Caller-data problems are reported rather than asserted, so a fuzzer or a
+/// long-running process gets an error it can handle instead of an abort.
+/// Backend refusal and post-submission execution failure have distinct variants
+/// so callers cannot mistake work that did not run for validated output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpError {
     /// A slice length did not match the prepared shape.
@@ -316,11 +321,28 @@ pub enum OpError {
         min: usize,
         got: usize,
     },
+    /// Deriving an operand length from caller-controlled dimensions overflowed
+    /// `usize` before any buffer was read or mutated.
+    SizeOverflow {
+        what: &'static str,
+        lhs: usize,
+        rhs: usize,
+    },
     /// [`SparseOp::spmv_t`] on an operator built without a reverse index.
     TransposeNotPrepared,
     /// The substrate refused the work and said why. Distinct from the length
     /// errors above: those are caller mistakes, this is the device declining.
     Backend { reason: &'static str },
+    /// Work was submitted but the device reported a terminal failure or did
+    /// not reach a terminal state before the backend's bounded deadline.
+    ///
+    /// This is distinct from [`OpError::Backend`]: construction and allocation
+    /// succeeded, but reading the output would otherwise turn a failed or
+    /// indefinitely stalled command buffer into a plausible successful result.
+    Execution {
+        operation: &'static str,
+        detail: String,
+    },
 }
 
 impl fmt::Display for OpError {
@@ -332,6 +354,9 @@ impl fmt::Display for OpError {
                 got,
             } => write!(f, "`{what}` must have length {expected}, got {got}"),
             Self::Backend { reason } => write!(f, "backend refused: {reason}"),
+            Self::Execution { operation, detail } => {
+                write!(f, "{operation}: device execution failed: {detail}")
+            }
             Self::TransposeNotPrepared => write!(
                 f,
                 "this operator has no reverse index; build it with \
@@ -339,6 +364,9 @@ impl fmt::Display for OpError {
             ),
             Self::TooShort { what, min, got } => {
                 write!(f, "`{what}` must have length >= {min}, got {got}")
+            }
+            Self::SizeOverflow { what, lhs, rhs } => {
+                write!(f, "{what} overflowed usize: {lhs} * {rhs}")
             }
         }
     }
@@ -493,10 +521,20 @@ pub fn tolerance_for_spmv(max_row_nnz: usize, max_abs_term: f32, max_abs_result:
     8.0 * f32::EPSILON * n.mul_add(term, result)
 }
 
-/// How an operator stores its weights.
+/// Quantisation selected when an operator's weights become resident.
 ///
-/// Storage only. Every kernel widens to `f32` and accumulates there — see
-/// [`crate::half`] for why a 500-term row sum at 16-bit width is not an option.
+/// The selection fixes the values used by every operation: `F16` and `Bf16`
+/// round initial inputs during [`Device::prepare_with`] and replacement inputs
+/// during [`SparseOp::set_weights`]. Arithmetic and accumulation remain f32 —
+/// see [`crate::half`] for why a 500-term row sum at 16-bit width is not an
+/// option.
+///
+/// This is not a promise that every resident copy is narrow. CPU operators
+/// store the quantised values widened to f32. Metal keeps that same f32 mirror
+/// for batched SpMM, transpose, packed spikes and fused SpMV+LIF, alongside a
+/// compact buffer used by plain [`SparseOp::spmv`] (and one-vector SpMM, which
+/// delegates to it). Consequently, [`WeightPrecision::bytes`] describes the
+/// compact encoding, not an operator's total resident footprint.
 ///
 /// This is an enum rather than the boolean it replaced. A second format made
 /// the boolean wrong: two flags would have admitted a state meaning "both
@@ -508,12 +546,16 @@ pub enum WeightPrecision {
     F32,
     /// IEEE binary16: 1+5+10. Finer than bfloat16, but overflows at 65504.
     F16,
-    /// bfloat16: 1+8+7. f32's exponent range, 8x coarser than binary16.
+    /// bfloat16: 1+8+7. f32's exponent field and nearly its range, 8x coarser.
     Bf16,
 }
 
 impl WeightPrecision {
-    /// Bytes one weight occupies in device memory.
+    /// Bytes one weight occupies in this compact encoding.
+    ///
+    /// This is not total resident memory. In particular, Metal operators with
+    /// a narrow encoding also keep a widened f32 mirror for operations other
+    /// than plain SpMV, and CPU operators keep only that mirror.
     pub const fn bytes(self) -> usize {
         match self {
             Self::F32 => 4,
@@ -532,7 +574,7 @@ impl WeightPrecision {
         }
     }
 
-    /// Round `weights` through this format, as `prepare` stores them.
+    /// Round `weights` through this format when they become resident.
     fn quantise(self, weights: &[f32]) -> Option<Vec<f32>> {
         use crate::half::*;
         match self {
@@ -563,7 +605,7 @@ impl WeightPrecision {
     }
 }
 
-/// Upper bound on a `y += A · x` row when the weights are stored as binary16.
+/// Upper bound on a `y += A · x` row when weights are quantised as binary16.
 ///
 /// The README used to record "narrower types need their bounds re-derived, not
 /// rescaled" as the reason f16 was missing. This is that derivation.
@@ -604,8 +646,9 @@ pub fn tolerance_for_spmv_f16(max_row_nnz: usize, max_abs_term: f32, max_abs_res
 ///
 /// The same derivation with a coarser constant: [`crate::half::BF16_EPSILON`]
 /// is 8x [`crate::half::HALF_EPSILON`], so this bound is roughly 8x looser.
-/// That is the trade bfloat16 makes — f32's exponent range for three
-/// significand bits — stated as a number rather than a preference.
+/// That is the trade bfloat16 makes — an 8-bit exponent field and nearly f32's
+/// range for three fewer significand bits — stated as a number rather than a
+/// preference.
 pub fn tolerance_for_spmv_bf16(max_row_nnz: usize, max_abs_term: f32, max_abs_result: f32) -> f32 {
     tolerance_for_spmv_narrow(
         WeightPrecision::Bf16,
@@ -638,7 +681,7 @@ pub fn tolerance_for_spmv_narrow(
     }
 }
 
-/// Upper bound on the disagreement between two backends' prefix scans.
+/// Conservative tolerance for the disagreement between two prefix scans.
 ///
 /// [`Device::assoc_scan`] is the one operation here whose *algorithm* differs
 /// by substrate. The CPU arms left-fold, and their output is bit-identical to
@@ -648,24 +691,34 @@ pub fn tolerance_for_spmv_narrow(
 /// needs a bound, exactly as SpMV does, and this is it.
 ///
 /// Composing `prefix_len` affine maps is a chain of that many multiply-adds in
-/// both `a` and `b`. Two parenthesizations of such a chain differ by the usual
-/// recursive-summation bound — proportional to the chain length and to the
-/// largest intermediate it reaches, not to the final value, which may be far
-/// smaller under cancellation:
+/// both `a` and `b`. Two parenthesizations differ in proportion to the chain
+/// length and its absolute condition scale, not merely to the final value,
+/// which may be far smaller under cancellation:
 ///
 /// ```text
 /// 8 · eps · prefix_len · max|intermediate|
 /// ```
 ///
-/// `max_abs_intermediate` is the largest `|b|` the *reference* chain passes
-/// through, floored at 1 so a chain that stays near zero still admits the
-/// rounding of the `a` product. Pass the longest prefix compared, not the mean.
+/// `magnitude_envelope` must bound both the multiplier product and the sum of
+/// absolute affine contributions. Use [`crate::scan_magnitude_envelope`] to
+/// derive it. Passing only the largest `|b|` is not sound for public [`State`]:
+/// a chain with `a > 1, b = 0` has a zero `b` throughout while its `a` error
+/// grows geometrically. Pass the longest prefix compared, not the mean.
 ///
-/// A bound, not a curve fitted to one machine — see [`tolerance_for_spmv`] for
-/// why that distinction is load-bearing here.
-pub fn tolerance_for_scan(prefix_len: usize, max_abs_intermediate: f32) -> f32 {
+/// The first-order model assumes finite f32 inputs and no arithmetic overflow.
+/// A non-finite envelope produces a non-finite tolerance rather than silently
+/// substituting a small scale. Callers must reject that case; the crate's
+/// differential comparator does. This keeps the existing two-argument API
+/// while making its required scalar honest for arbitrary finite [`State`]
+/// values.
+///
+/// [`State`]: crate::State
+pub fn tolerance_for_scan(prefix_len: usize, magnitude_envelope: f32) -> f32 {
+    if !magnitude_envelope.is_finite() {
+        return magnitude_envelope.abs();
+    }
     let n = prefix_len.max(1) as f32;
-    let magnitude = max_abs_intermediate.abs().max(1.0);
+    let magnitude = magnitude_envelope.abs().max(1.0);
     8.0 * f32::EPSILON * n * magnitude
 }
 
@@ -695,9 +748,11 @@ impl DeviceInner {
     }
 }
 
-/// A handle to a substrate that is known to be able to execute.
+/// A handle to a substrate that was available when the handle was created.
 ///
-/// Cloning is cheap; GPU state is shared, not duplicated.
+/// Cloning is cheap; GPU state is shared, not duplicated. A Metal command
+/// timeout dynamically quarantines that backend, after which existing handles
+/// fail closed rather than reusing resources that may still be in flight.
 #[derive(Clone)]
 pub struct Device {
     backend: Backend,
@@ -856,13 +911,22 @@ impl Device {
         )
     }
 
-    /// [`Device::prepare`] with the weights stored as IEEE binary16.
+    /// [`Device::prepare`] with weights quantised to IEEE binary16 on residency.
     ///
-    /// Takes f32 weights and narrows them. On `Backend::Metal` the SpMV kernel
-    /// then streams 2 bytes per non-zero instead of 4. `col_ind` stays 4 bytes,
-    /// so traffic per non-zero goes 8 to 6 — a 25% cut, not the 2x that halving
-    /// one of the two arrays might suggest. `examples/narrow_crossover.rs`
-    /// measures what that is actually worth.
+    /// Takes f32 weights and quantises them once. On `Backend::Metal`, plain
+    /// [`SparseOp::spmv`] then streams the compact 2-byte values instead of
+    /// 4-byte values. `col_ind` stays 4 bytes, so traffic per non-zero goes 8
+    /// to 6 — a 25% cut, not the 2x that halving one of the two arrays might
+    /// suggest. `examples/narrow_crossover.rs` measures what that is actually
+    /// worth.
+    ///
+    /// Metal also retains the quantised values widened to f32. Batched
+    /// [`SparseOp::spmm`] (`n_vec > 1`), [`SparseOp::spmv_t`],
+    /// [`SparseOp::spmv_spikes`] and [`SparseOp::fused_spmv_lif`] read that
+    /// mirror; one-vector SpMM delegates to plain SpMV. The selected
+    /// quantisation therefore applies to every operation, while the compact
+    /// bandwidth path applies only to plain SpMV. CPU operators retain only
+    /// the widened f32 representation.
     ///
     /// # Both arms store the same values
     ///
@@ -880,7 +944,7 @@ impl Device {
     /// saves no bandwidth. Stated rather than hidden: this entry point exists
     /// for the GPU, and a CPU operator built with it is for checking the GPU
     /// rather than for going faster. [`SparseOp::weight_precision`] reports the
-    /// storage an operator actually has.
+    /// compact execution representation available to plain SpMV.
     ///
     /// # Range
     ///
@@ -904,7 +968,7 @@ impl Device {
         )
     }
 
-    /// [`Device::prepare`] with an explicit storage format.
+    /// [`Device::prepare`] with an explicit resident quantisation.
     ///
     /// The general form. [`Device::prepare`], [`Device::prepare_f16`] and
     /// [`Device::prepare_bf16`] are named conveniences over it, and exist
@@ -921,7 +985,7 @@ impl Device {
         SparseOp::prepare(self.clone(), csr, ncols, weights, false, precision)
     }
 
-    /// [`Device::prepare`] with the weights stored as bfloat16.
+    /// [`Device::prepare`] with weights quantised to bfloat16 on residency.
     ///
     /// The other narrow option. Against [`Device::prepare_f16`] the trade is
     /// range for precision: bfloat16 carries f32's exponent field, so it does
@@ -929,9 +993,10 @@ impl Device {
     /// Neither is a default — which is right depends on the weights, and
     /// [`tolerance_for_spmv_bf16`] prices the difference.
     ///
-    /// Bandwidth is identical: both store 2 bytes per weight. On the measured
-    /// shapes that is worth a few percent, not a doubling; see
-    /// `examples/narrow_crossover.rs`.
+    /// Plain Metal SpMV bandwidth is identical: both compact buffers encode 2
+    /// bytes per weight. On the measured shapes that is worth a few percent,
+    /// not a doubling; see `examples/narrow_crossover.rs`. The f32 mirror and
+    /// operation scope documented by [`Device::prepare_f16`] apply unchanged.
     ///
     /// Everything [`Device::prepare_f16`] documents about *where* the error
     /// lives applies unchanged — the weights are quantised once before either
@@ -985,7 +1050,9 @@ impl Device {
     ///
     /// The CPU arms run [`crate::assoc_scan`], which is bit-identical to a
     /// sequential left-fold — it buys that by making its first phase a complete
-    /// sequential fold, about `2n` combines to replace `n`, measured at 1.08x.
+    /// sequential fold, about `2n` combines to replace `n`. The hardened paired
+    /// sampler has not established a throughput crossover for that extra work;
+    /// see [`crate::scan`] and `examples/scan_crossover.rs`.
     /// The Metal arm runs a two-level Hillis-Steele scan that reassociates, so
     /// it is genuinely parallel and is **not** bit-identical to the CPU arms.
     ///
@@ -1002,12 +1069,14 @@ impl Device {
     ///
     /// # This is slower on Metal, measured
     ///
-    /// Not a throughput path. At 4.2M elements the Metal arm takes ~14.4 ms
-    /// against ~6.5 ms for the sequential CPU fold — 0.45x — and it loses by
-    /// more at every smaller size (0.13x at 0.1M). A scan over affine maps is
-    /// three flops per
-    /// sixteen bytes moved, so it is memory-bound, and the three-phase tree
-    /// makes roughly five passes over memory where a fold makes one.
+    /// Not a throughput path. In the latest bounded, paired run on an M5 Pro,
+    /// CPU-sequential/Metal median speedups were 0.23x, 0.33x, 0.56x and 0.48x
+    /// at 64K, 256K, 1M and 4M elements: Metal lost at every size. Several CPU
+    /// arms were noisy, so `examples/scan_crossover.rs` reports max/min spread
+    /// and full provenance rather than presenting those ratios as universal
+    /// constants. A scan over affine maps is three flops per sixteen bytes
+    /// moved, so it is memory-bound, and the three-phase tree makes roughly
+    /// five passes over memory where a fold makes one.
     ///
     /// It exists so `Backend::Metal` can run every operation this crate offers
     /// rather than silently falling back to CPU under a GPU label, which is the
@@ -1024,11 +1093,9 @@ impl Device {
             }),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             DeviceInner::Metal(d) => {
-                let pairs: Vec<(f32, f32)> = xs.iter().map(|s| (s.a, s.b)).collect();
-                let out = d
-                    .assoc_scan(&pairs)
-                    .map_err(|reason| OpError::Backend { reason })?;
-                Ok(out.into_iter().map(|(a, b)| State { a, b }).collect())
+                // No reformatting: `State` is `repr(C)` and two packed `f32`s,
+                // so the slice is already the layout the kernel reads.
+                d.assoc_scan(xs)
             }
         }
     }
@@ -1061,10 +1128,7 @@ impl Device {
                 Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            DeviceInner::Metal(d) => {
-                d.lif_integrate(v, theta, currents, spikes, params);
-                Ok(())
-            }
+            DeviceInner::Metal(d) => d.lif_integrate(v, theta, currents, spikes, params),
         }
     }
 }
@@ -1095,7 +1159,7 @@ enum OpResident {
 pub struct SparseOp {
     device: Device,
     shape: SparseShape,
-    /// The storage this operator was built with.
+    /// The quantisation applied whenever this operator stores new weights.
     ///
     /// Kept because `set_weights` has to preserve the contract. Without it a
     /// narrow operator quietly stopped being narrow on the first update: the
@@ -1213,11 +1277,11 @@ impl SparseOp {
             } => {
                 stored.clear();
                 stored.extend_from_slice(weights);
+                Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             OpResident::Metal(op) => op.set_weights(weights),
         }
-        Ok(())
     }
 
     /// `y += A · x`, using the values this operator holds.
@@ -1237,10 +1301,7 @@ impl SparseOp {
                 Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            OpResident::Metal(op) => {
-                op.spmv(x, y);
-                Ok(())
-            }
+            OpResident::Metal(op) => op.spmv(x, y),
         }
     }
 
@@ -1279,10 +1340,7 @@ impl SparseOp {
                 Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            OpResident::Metal(op) => {
-                op.spmv_spikes(spikes, y);
-                Ok(())
-            }
+            OpResident::Metal(op) => op.spmv_spikes(spikes, y),
         }
     }
 
@@ -1356,19 +1414,19 @@ impl SparseOp {
             .shape
             .ncols()
             .checked_mul(n_vec)
-            .ok_or(OpError::Length {
-                what: "x",
-                expected: usize::MAX,
-                got: n_vec,
+            .ok_or(OpError::SizeOverflow {
+                what: "SpMM input element count",
+                lhs: self.shape.ncols(),
+                rhs: n_vec,
             })?;
         let need_y = self
             .shape
             .nrows()
             .checked_mul(n_vec)
-            .ok_or(OpError::Length {
-                what: "y",
-                expected: usize::MAX,
-                got: n_vec,
+            .ok_or(OpError::SizeOverflow {
+                what: "SpMM output element count",
+                lhs: self.shape.nrows(),
+                rhs: n_vec,
             })?;
         require_min_len("x", x.len(), need_x)?;
         require_len("y", y.len(), need_y)?;
@@ -1389,13 +1447,14 @@ impl SparseOp {
         }
     }
 
-    /// The storage this operator's weights actually occupy.
+    /// The compact execution representation available to plain SpMV.
     ///
-    /// Narrow only for a Metal operator. A CPU operator built by
-    /// [`Device::prepare_f16`] or [`Device::prepare_bf16`] holds *quantised*
-    /// values in f32 storage, so it reports [`WeightPrecision::F32`] — this
-    /// describes the storage that exists, not the entry point that was
-    /// called.
+    /// This is not the source-value history or total resident footprint. A CPU
+    /// operator built by [`Device::prepare_f16`] or [`Device::prepare_bf16`]
+    /// holds quantised values in f32 storage, so it reports
+    /// [`WeightPrecision::F32`]. A narrow Metal operator reports its compact
+    /// plain-SpMV encoding, but also retains the same quantised values in an
+    /// f32 mirror used by the other weighted operations.
     pub fn weight_precision(&self) -> WeightPrecision {
         match &self.resident {
             // The CPU arm holds quantised values in f32 storage: it pays the
@@ -1419,10 +1478,11 @@ impl SparseOp {
     /// Fused `current = A · x` followed by the LIF membrane update, without
     /// materialising the current vector.
     ///
-    /// On Metal this reduces each row with `simd_sum`, a tree reduction whose
-    /// order differs from both CPU arms and from [`SparseOp::spmv`]. Expect it
-    /// to land further from the CPU reference than plain SpMV does; size any
-    /// comparison with [`tolerance_for_spmv`].
+    /// On Metal this reduces each row exactly as the operator's
+    /// [`SparseOp::spmv`] does — the same lane team and the same butterfly
+    /// fold, chosen once per operator — so it lands no further from the CPU
+    /// reference than plain SpMV; that order still differs from both CPU
+    /// arms, so size any comparison with [`tolerance_for_spmv`].
     pub fn fused_spmv_lif(
         &self,
         x: &[f32],
@@ -1448,10 +1508,7 @@ impl SparseOp {
                 Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
-            OpResident::Metal(op) => {
-                op.fused_spmv_lif(x, v, theta, spikes, params);
-                Ok(())
-            }
+            OpResident::Metal(op) => op.fused_spmv_lif(x, v, theta, spikes, params),
         }
     }
 }

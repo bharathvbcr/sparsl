@@ -3,14 +3,14 @@
 //! `tolerance_for_elementwise` is not a guess at how far apart two substrates
 //! might drift; it is sized for one specific, identified cause. Metal contracts
 //! `v * decay + current` into a single `fma`, rounding once where the CPU
-//! rounds twice. Asking for conservative semantics does not prevent it: the
-//! backend sets `MTLMathMode::Safe`, and contraction happens anyway.
+//! rounds twice. Apple defines `MTLMathMode::Safe` as disabling unsafe
+//! floating-point optimisations, not as promising the CPU's exact operation
+//! sequence; the tested Metal compiler contracts this expression in Safe mode.
 //!
-//! This test proves the cause is that and nothing else: every non-spiking GPU
-//! membrane must match one of the two roundings *bit for bit*. A single value
-//! matching neither would mean the gap has some other source, and the tolerance
-//! elsewhere in the suite would be covering up a real defect rather than a
-//! known rounding choice.
+//! This test constrains the exercised path: every non-spiking GPU membrane must
+//! match one of the two roundings *bit for bit*. A single value matching neither
+//! would mean the gap has some other source, and the tolerance elsewhere in the
+//! suite would be covering up a real defect rather than a known rounding choice.
 //!
 //! It deliberately does not assert *which* rounding wins. Contraction is a
 //! compiler decision that may legitimately change between Metal versions; what

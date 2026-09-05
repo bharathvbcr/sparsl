@@ -50,6 +50,23 @@ pub fn max_abs(values: &[f32]) -> f32 {
     })
 }
 
+/// Largest number of stored entries gathered by one output of `A^T * x`.
+///
+/// A forward SpMV reduces one CSR row, so `SparseShape::max_row_nnz()` sizes
+/// its tolerance. A transposed product reduces one original matrix column;
+/// using the row degree there can under-bound a highly skewed rectangular
+/// matrix even though every input and output length is valid.
+pub fn max_col_nnz(csr: &Csr, ncols: usize) -> usize {
+    let mut counts = vec![0usize; ncols];
+    for (edge, &col) in csr.col.iter().enumerate() {
+        let count = counts.get_mut(col as usize).unwrap_or_else(|| {
+            panic!("test fixture edge {edge} has column {col} outside ncols={ncols}")
+        });
+        *count += 1;
+    }
+    counts.into_iter().max().unwrap_or(0)
+}
+
 /// Every backend that can execute, minus the CPU reference itself.
 pub fn backends_under_test() -> Vec<Backend> {
     sparsl::available_backends()
@@ -70,12 +87,27 @@ pub fn default_params() -> LifParams {
 /// Assert two float slices agree within `tol`, reporting the worst offender.
 pub fn assert_close(got: &[f32], want: &[f32], tol: f32, context: &str) {
     assert_eq!(got.len(), want.len(), "{context}: length mismatch");
+    assert!(
+        tol.is_finite() && tol >= 0.0,
+        "{context}: tolerance must be finite and non-negative, got {tol}"
+    );
+    if got.is_empty() {
+        return;
+    }
+
     let mut worst = 0.0f32;
     let mut worst_i = 0usize;
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         let d = if g.is_nan() && w.is_nan() {
             0.0
+        } else if g == w {
+            // Includes like-signed infinities as well as equal finite values.
+            0.0
         } else {
+            assert!(
+                g.is_finite() && w.is_finite(),
+                "{context}: non-finite mismatch at index {i} (got {g}, want {w})"
+            );
             (g - w).abs()
         };
         if d > worst {
@@ -90,6 +122,30 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, context: &str) {
         got[worst_i],
         want[worst_i]
     );
+}
+
+/// Compare the part of a float result that a non-finite propagation test owns.
+///
+/// Finite reference values require only a finite result here; ordinary numeric
+/// accuracy belongs to the differential tests. NaNs must remain NaNs, while an
+/// infinity must preserve its sign. Checking only `is_finite` and `is_nan`
+/// cannot distinguish `+inf` from `-inf` and would let sign-flipped propagation
+/// pass.
+pub fn assert_same_numeric_class(got: f32, want: f32, context: &str) {
+    if want.is_nan() {
+        assert!(got.is_nan(), "{context}: expected NaN, got {got}");
+    } else if want.is_infinite() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{context}: expected {want}, got {got}"
+        );
+    } else {
+        assert!(
+            got.is_finite(),
+            "{context}: expected a finite value, got {got}"
+        );
+    }
 }
 
 /// Outcome of comparing a LIF step across backends.
@@ -126,6 +182,23 @@ pub fn compare_lif(
     context: &str,
 ) -> LifComparison {
     let n = v_want.len();
+    for (name, len) in [
+        ("v_got", v_got.len()),
+        ("theta_got", theta_got.len()),
+        ("spikes_got", spikes_got.len()),
+        ("theta_want", theta_want.len()),
+        ("spikes_want", spikes_want.len()),
+        ("v_pre", v_pre.len()),
+        ("theta_pre", theta_pre.len()),
+        ("current_ref", current_ref.len()),
+    ] {
+        assert_eq!(len, n, "{context}: {name} length mismatch");
+    }
+    assert!(
+        tol.is_finite() && tol >= 0.0,
+        "{context}: tolerance must be finite and non-negative, got {tol}"
+    );
+
     let mut flips = 0usize;
     for i in 0..n {
         if spikes_got[i] == spikes_want[i] {

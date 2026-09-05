@@ -125,7 +125,10 @@ pub use backend::{
 };
 pub use buffer::Buffer;
 pub use rng::Rng;
-pub use scan::{assoc_scan, assoc_scan_chunked, assoc_scan_sequential, State, DEFAULT_CHUNK_SIZE};
+pub use scan::{
+    assoc_scan, assoc_scan_chunked, assoc_scan_sequential, scan_magnitude_envelope, State,
+    DEFAULT_CHUNK_SIZE,
+};
 pub use simd::{scalar_leak_integrate, simd_leak_integrate, LANES};
 pub use sparse::{Csc, Csr, CsrError};
 pub use time::Tick;

@@ -58,13 +58,22 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTLComputeCommandEncoder",
     "MTLComputePipeline",
     "MTLDevice",
+    # `MTLSharedEvent`: bounded completion waits. Every command buffer signals
+    # a monotonic value on the GPU timeline and the host blocks on
+    # `waitUntilSignaledValue:timeoutMS:` instead of sleeping in a doubling
+    # poll that overshot short kernels by up to a millisecond.
+    "MTLEvent",
     "MTLLibrary",
     "MTLResource",
     "MTLTypes",
 ] }
 
 [dev-dependencies]
-proptest = "1"
+# Proptest 1.7+ migrated to rand 0.9; its current WASI dependency branch contains
+# an edition-2024 manifest that Cargo 1.82 cannot even parse during metadata
+# resolution. The in-process differential suite needs none of those newer APIs,
+# fork, or timeout support, so pin the newest rand-0.8 line and keep only `std`.
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }
 
 [[example]]
 name = "scan_crossover"

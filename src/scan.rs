@@ -18,15 +18,18 @@
 //! to a sequential scan. Phase 2 then redoes that work in parallel. So the
 //! total is roughly `2n` `combine` calls to replace `n`.
 //!
-//! Measured on 4M elements with all cores idle: 6.92 ms chunked against 7.48 ms
-//! sequential. **1.08x.** Earlier wording here called it "a partial
-//! parallel-in-time assist"; at that margin it is not one, and describing it as
-//! such invites someone to reach for it expecting a speedup.
+//! An earlier two-sample idle run suggested 6.92 ms chunked against 7.48 ms
+//! sequential at 4M elements. The hardened sampler did not reproduce a CPU
+//! crossover: paired median sequential/chunked speedups rose from 0.02x at 257
+//! elements to 0.69x at 786K and remained below parity through 8M on the same
+//! M5 Pro. Larger arms became noisy under host load, so there is no defensible
+//! universal routing threshold in that run; the provenance and spreads are
+//! evidence, while the old 1.08x point is only historical.
 //!
 //! What it buys is the *property*: a chunked, rayon-backed scan whose output is
-//! bit-identical to the sequential fold, which is what lets the parallel path be
-//! used at all where results are replayed by hash. Neuron, area and stream
-//! parallelism remain the throughput lever.
+//! bit-identical to the sequential fold. It does not currently justify choosing
+//! this path for throughput; neuron, area and stream parallelism remain that
+//! lever.
 //!
 //! # The tree scan is slower, measured
 //!
@@ -35,17 +38,14 @@
 //! now exists — [`crate::Device::assoc_scan`] on `Backend::Metal` — and it is
 //! **slower than the sequential CPU fold at every size measured**:
 //!
-//! ```text
-//!            cpu sequential      Metal        ratio
-//! n = 0.1M       0.09 ms         0.72 ms      0.13x
-//! n = 0.3M       0.39 ms         1.56 ms      0.26x
-//! n = 1.0M       1.61 ms         4.38 ms      0.37x
-//! n = 4.2M       6.47 ms        14.38 ms      0.45x
-//! ```
-//!
-//! Two full sweeps, arms timed in both orders, spreads at 4.2M within 1.19.
-//! The gap narrows as `n` grows — 0.13x to 0.45x — so the GPU is amortising
-//! its fixed costs, but it does not reach parity anywhere in this range.
+//! The latest hardened run on the same M5 Pro used bounded warmup and eight
+//! paired, order-alternating rounds. Its paired median CPU-sequential/Metal
+//! speedups were 0.23x, 0.33x, 0.56x and 0.48x at 64K, 256K, 1M and 4M
+//! elements: Metal did not reach parity anywhere in the measured range. Several
+//! CPU arms had high max/min spread, so these are evidence for the direction of
+//! the result, not universal latency constants. The benchmark prints those
+//! spreads and full host/build provenance rather than hiding them behind one
+//! optimistic sample.
 //!
 //! The reason is arithmetic intensity: composing two affine maps is three flops
 //! over eight bytes in and eight out, so this is purely memory-bound, and the
@@ -67,13 +67,33 @@ pub const DEFAULT_CHUNK_SIZE: usize = 256;
 ///
 /// Composing steps is an associative monoid with identity `(a=1, b=0)`, which
 /// is what enables a chunked prefix scan over reset-free segments.
+///
+/// `repr(C)` is load-bearing, not decoration. The Metal scan uploads a
+/// `&[State]` straight to the device and reads the result straight back, so the
+/// in-memory layout *is* the wire format the kernel indexes as
+/// `[a0, b0, a1, b1, …]`. Rust's default repr guarantees no field order, so
+/// without this the upload could silently transpose every pair. The layout is
+/// pinned by a compile-time assertion below and by
+/// `state_layout_matches_flat_f32` in the test suite.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
 pub struct State {
     /// Multiplier applied to the incoming voltage.
     pub a: f32,
     /// Additive drive after the leak scale.
     pub b: f32,
 }
+
+// Compile-time proof that `State` is exactly two packed `f32`s. The Metal
+// backend's zero-reformat/direct typed byte-copy upload is sound only if this
+// holds. Keep this anonymous:
+// a named private const linked from public docs fails rustdoc's
+// `private_intra_doc_links` lint, while a named-but-unused const warns on the
+// crate's Rust 1.82 MSRV.
+const _: () = {
+    assert!(core::mem::size_of::<State>() == 2 * core::mem::size_of::<f32>());
+    assert!(core::mem::align_of::<State>() == core::mem::align_of::<f32>());
+};
 
 impl State {
     /// Monoid identity: `v' = v`.
@@ -109,6 +129,61 @@ impl State {
             a: next.a * self.a,
             b: next.a * self.b + next.b,
         }
+    }
+}
+
+/// Conservative magnitude envelope for comparing affine prefix scans.
+///
+/// This is the scale expected by [`crate::backend::tolerance_for_scan`]. It is
+/// deliberately not just the largest output `|b|`: [`State`] is public and may
+/// contain multipliers with `|a| > 1`, and cancellation can make an output tiny
+/// even though the arithmetic that formed it was large.
+///
+/// The envelope tracks two different quantities:
+///
+/// ```text
+/// A_suffix <- |a| max(1, A_suffix)
+/// B_prefix <- |a| B_prefix + |b|
+/// ```
+///
+/// and returns the largest value reached, floored at one. `B_prefix` is the sum
+/// of the absolute affine contributions, so it remains conservative under
+/// cancellation. `A_suffix` is the largest product of a contiguous multiplier
+/// subchain ending at the current element. Tracking only the full prefix is not
+/// sufficient: a tree may first multiply two large later states and only then
+/// combine that intermediate with a tiny early multiplier. Every intermediate
+/// produced by a valid reassociation is a contiguous subchain, so the suffix
+/// recurrence covers exactly that missing scale. The recurrences are evaluated
+/// in `f64` and rounded upward on conversion to `f32`. A non-finite input or an
+/// envelope too large for `f32` returns infinity, signalling that no finite f32
+/// comparison scale is available.
+pub fn scan_magnitude_envelope(xs: &[State]) -> f32 {
+    let (mut suffix_a, mut prefix_b, mut envelope) = (1.0f64, 0.0f64, 1.0f64);
+
+    for state in xs {
+        let (a, b) = (f64::from(state.a.abs()), f64::from(state.b.abs()));
+        if !a.is_finite() || !b.is_finite() {
+            return f32::INFINITY;
+        }
+
+        // A tree scan can materialise any contiguous multiplier subchain. If
+        // the previous suffix product is below one, starting a new subchain at
+        // this state is the larger choice; otherwise extending it is larger.
+        suffix_a = a * suffix_a.max(1.0);
+        prefix_b = a * prefix_b + b;
+        if !suffix_a.is_finite() || !prefix_b.is_finite() {
+            return f32::INFINITY;
+        }
+        envelope = envelope.max(suffix_a).max(prefix_b);
+    }
+
+    let rounded = envelope as f32;
+    if !rounded.is_finite() || f64::from(rounded) >= envelope {
+        rounded
+    } else {
+        // `envelope` is positive and `rounded` is finite, so the next larger
+        // bit pattern is the next representable positive f32.
+        f32::from_bits(rounded.to_bits() + 1)
     }
 }
 
@@ -239,7 +314,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{assoc_scan, assoc_scan_chunked, assoc_scan_sequential, State, DEFAULT_CHUNK_SIZE};
+    use super::{
+        assoc_scan, assoc_scan_chunked, assoc_scan_sequential, scan_magnitude_envelope, State,
+        DEFAULT_CHUNK_SIZE,
+    };
     use crate::rng::Rng;
 
     fn combine(a: State, b: State) -> State {
@@ -276,6 +354,57 @@ mod tests {
         let xs = [State::leak_step(1.0, 2.0, 1.0)];
         let out = assoc_scan(&xs, combine);
         assert_eq!(out, xs);
+    }
+
+    #[test]
+    fn magnitude_envelope_covers_growth_and_cancellation() {
+        let cancelling = [State { a: 2.0, b: 3.0 }, State { a: -4.0, b: 12.0 }];
+        // The composed b is exactly zero, but its two absolute contributions
+        // sum to 24; the multiplier product contributes 8.
+        assert_eq!(cancelling[0].combine(cancelling[1]).b, 0.0);
+        assert_eq!(scan_magnitude_envelope(&cancelling), 24.0);
+
+        let a = f32::from_bits(1.0f32.to_bits() + 1);
+        let exact_product = f64::from(a) * f64::from(a);
+        let rounded = scan_magnitude_envelope(&[State { a, b: 0.0 }; 2]);
+        assert!(
+            f64::from(rounded) >= exact_product,
+            "envelope rounded down: {rounded} < {exact_product}"
+        );
+    }
+
+    #[test]
+    fn magnitude_envelope_covers_tree_local_multiplier_growth() {
+        // A tree scan forms the suffix product of the final two states before
+        // it combines that result with the tiny first multiplier. Looking only
+        // at prefixes sees 1e-20, 1e-10 and ~1, but the actual tree
+        // intermediate is ~1e20. The comparison scale must cover every
+        // contiguous subchain a valid reassociation can materialise.
+        let xs = [
+            State { a: 1.0e-20, b: 0.0 },
+            State { a: 1.0e10, b: 0.0 },
+            State { a: 1.0e10, b: 0.0 },
+        ];
+        let tree_local_product = f64::from(xs[1].a) * f64::from(xs[2].a);
+        let envelope = scan_magnitude_envelope(&xs);
+        assert!(
+            f64::from(envelope) >= tree_local_product,
+            "envelope missed a tree-local product: {envelope} < {tree_local_product}"
+        );
+    }
+
+    #[test]
+    fn magnitude_envelope_refuses_non_finite_inputs() {
+        assert!(scan_magnitude_envelope(&[State {
+            a: f32::NAN,
+            b: 0.0
+        }])
+        .is_infinite());
+        assert!(scan_magnitude_envelope(&[State {
+            a: 1.0,
+            b: f32::INFINITY
+        }])
+        .is_infinite());
     }
 
     #[test]

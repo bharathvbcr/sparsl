@@ -59,10 +59,18 @@ impl std::error::Error for CsrError {}
 ///
 /// `row_ptr` has length `nrows + 1`. Neighbors of row `r` are the column
 /// indices `col[row_ptr[r] as usize .. row_ptr[r + 1] as usize]`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Csr {
     pub row_ptr: Vec<u32>,
     pub col: Vec<u32>,
+}
+
+impl Default for Csr {
+    /// Return the structurally valid zero-row CSR (`row_ptr == [0]`).
+    #[inline]
+    fn default() -> Self {
+        Self::empty(0)
+    }
 }
 
 impl Csr {
@@ -79,23 +87,52 @@ impl Csr {
     }
 
     /// Build from per-row adjacency lists.
+    ///
+    /// # Panics
+    ///
+    /// If the row-pointer table cannot be represented by `usize`, or if the
+    /// total non-zero count cannot be represented by the CSR format's `u32`
+    /// offsets. These cases cannot be returned from this historically
+    /// infallible constructor; rejecting them before allocation preserves its
+    /// signature without allowing a wrapped, valid-looking CSR.
     pub fn from_adjacency(rows: &[Vec<u32>]) -> Self {
         let nrows = rows.len();
-        let mut row_ptr = Vec::with_capacity(nrows + 1);
-        let nnz: usize = rows.iter().map(Vec::len).sum();
+        let row_ptr_len = nrows
+            .checked_add(1)
+            .expect("CSR row-pointer length overflowed usize");
+        let nnz = rows
+            .iter()
+            .try_fold(0usize, |total, row| total.checked_add(row.len()))
+            .expect("CSR adjacency non-zero count overflowed usize");
+        u32::try_from(nnz)
+            .expect("CSR adjacency has more non-zeros than u32 offsets can represent");
+
+        let mut row_ptr = Vec::with_capacity(row_ptr_len);
         let mut col = Vec::with_capacity(nnz);
         row_ptr.push(0);
         for row in rows {
             col.extend_from_slice(row);
-            row_ptr.push(col.len() as u32);
+            row_ptr.push(
+                u32::try_from(col.len())
+                    .expect("CSR adjacency offset exceeded the prevalidated u32 range"),
+            );
         }
         Self { row_ptr, col }
     }
 
     /// Empty graph with `nrows` rows and no edges.
+    ///
+    /// # Panics
+    ///
+    /// If `nrows + 1` cannot be represented by `usize`. The pointer-table
+    /// length is checked explicitly so release builds cannot wrap it to zero
+    /// and return an invalid, apparently empty CSR.
     pub fn empty(nrows: usize) -> Self {
+        let row_ptr_len = nrows
+            .checked_add(1)
+            .expect("CSR row-pointer length overflowed usize");
         Self {
-            row_ptr: vec![0; nrows + 1],
+            row_ptr: vec![0; row_ptr_len],
             col: Vec::new(),
         }
     }
@@ -188,7 +225,7 @@ impl Csr {
 /// Columns are postsynaptic cells. Each CSC entry stores the presynaptic row and
 /// the CSR edge index so synapse / weight tables stay CSR-ordered while
 /// postsynaptic fan-in is `O(degree_in)` instead of `O(nnz)`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Csc {
     /// Column pointers; length `ncols + 1`.
     pub col_ptr: Vec<u32>,
@@ -198,11 +235,28 @@ pub struct Csc {
     pub edge_idx: Vec<u32>,
 }
 
+impl Default for Csc {
+    /// Return the structurally valid zero-column CSC (`col_ptr == [0]`).
+    #[inline]
+    fn default() -> Self {
+        Self::empty(0)
+    }
+}
+
 impl Csc {
     /// Empty reverse index with `ncols` columns and no edges.
+    ///
+    /// # Panics
+    ///
+    /// If `ncols + 1` cannot be represented by `usize`. The pointer-table
+    /// length is checked explicitly so release builds cannot wrap it to zero
+    /// and return an invalid, apparently empty CSC.
     pub fn empty(ncols: usize) -> Self {
+        let col_ptr_len = ncols
+            .checked_add(1)
+            .expect("CSC column-pointer length overflowed usize");
         Self {
-            col_ptr: vec![0; ncols + 1],
+            col_ptr: vec![0; col_ptr_len],
             row: Vec::new(),
             edge_idx: Vec::new(),
         }
@@ -231,6 +285,12 @@ impl Csc {
     /// not how many exist, so a matrix whose last columns are all empty is
     /// indistinguishable from a narrower one.
     pub fn from_csr_rect(csr: &Csr, ncols: usize) -> Result<Self, CsrError> {
+        // `Csr` has an explicitly unchecked constructor, so a public API that
+        // accepts `&Csr` cannot assume these invariants still hold. Besides
+        // contradicting this module's contract, trusting `row_ptr` here used
+        // to turn an nnz mismatch into an indexing panic below.
+        validate(&csr.row_ptr, &csr.col)?;
+
         if ncols == 0 {
             // An operator with no columns can still have rows; it just has
             // nowhere to store an edge. A non-empty `col` here means the CSR
@@ -341,6 +401,67 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn empty_constructors_reject_dimension_overflow() {
+        for (name, constructor) in [
+            ("CSR", Csr::empty as fn(usize) -> Csr),
+            ("CSC", |n| {
+                let csc = Csc::empty(n);
+                Csr::from_parts_unchecked(csc.col_ptr, csc.row)
+            }),
+        ] {
+            let result = std::panic::catch_unwind(|| constructor(usize::MAX));
+            assert!(
+                result.is_err(),
+                "{name} empty constructor must reject n + 1 overflow instead of returning an invalid empty pointer table"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_defaults_are_structurally_valid_zero_dimension_empties() {
+        let csr = Csr::default();
+        assert_eq!(csr, Csr::empty(0));
+        assert_eq!(
+            Csr::from_parts(csr.row_ptr.clone(), csr.col.clone()),
+            Ok(csr)
+        );
+
+        assert_eq!(Csc::default(), Csc::empty(0));
+    }
+
+    #[test]
+    fn default_csr_converts_through_square_and_rectangular_apis() {
+        let csr = Csr::default();
+        let expected = Csc::empty(0);
+
+        assert_eq!(csr.to_csc(), expected);
+        assert_eq!(csr.to_csc_rect(0), Ok(expected));
+    }
+
+    /// A material fixture would require more than four billion `u32`s. Pin the
+    /// narrowing boundary in source instead: a plain `as u32` silently wraps in
+    /// release, while `try_from` is checked in every build profile.
+    #[test]
+    fn adjacency_offsets_are_checked_before_narrowing() {
+        let source = include_str!("sparse.rs");
+        let body = source
+            .split_once("pub fn from_adjacency")
+            .expect("from_adjacency source")
+            .1
+            .split_once("/// Empty graph")
+            .expect("end of from_adjacency source")
+            .0;
+        assert!(
+            body.contains("u32::try_from(col.len())"),
+            "from_adjacency must validate each usize offset before storing it as u32"
+        );
+        assert!(
+            !body.contains("row_ptr.push(col.len() as u32)"),
+            "from_adjacency must never silently truncate an offset"
+        );
+    }
+
+    #[test]
     fn csr_from_adjacency_neighbors() {
         let csr = Csr::from_adjacency(&[vec![1, 2], vec![0], vec![]]);
         assert_eq!(csr.nrows(), 3);
@@ -368,6 +489,47 @@ mod tests {
                 col_len: 2
             })
         );
+    }
+
+    #[test]
+    fn csc_from_csr_rect_rejects_structurally_invalid_csr() {
+        let cases = [
+            (
+                "empty row_ptr",
+                Csr::from_parts_unchecked(vec![], vec![]),
+                0,
+                CsrError::EmptyRowPtr,
+            ),
+            (
+                "non-zero row_ptr start",
+                Csr::from_parts_unchecked(vec![1, 1], vec![]),
+                0,
+                CsrError::NonZeroStart { start: 1 },
+            ),
+            (
+                "non-monotonic row_ptr",
+                Csr::from_parts_unchecked(vec![0, 2, 1], vec![0]),
+                3,
+                CsrError::NotMonotonic { index: 2 },
+            ),
+            (
+                "row_ptr/nnz mismatch",
+                Csr::from_parts_unchecked(vec![0, 2], vec![0]),
+                3,
+                CsrError::NnzMismatch {
+                    row_ptr_end: 2,
+                    col_len: 1,
+                },
+            ),
+        ];
+
+        for (name, csr, ncols, expected) in cases {
+            let result = std::panic::catch_unwind(|| Csc::from_csr_rect(&csr, ncols));
+            let actual = result.unwrap_or_else(|_| {
+                panic!("{name}: conversion panicked instead of returning {expected}")
+            });
+            assert_eq!(actual, Err(expected), "{name}");
+        }
     }
 
     #[test]

@@ -1,26 +1,30 @@
-//! Narrow 16-bit float storage, as raw `u16` bits.
+//! Narrow 16-bit weight encodings, as raw `u16` bits.
 //!
 //! Two formats, and the difference between them is the whole reason both
 //! exist. IEEE binary16 spends its 16 bits as 1+5+10, buying precision and
 //! paying for it with a range that stops at 65504. bfloat16 spends them as
-//! 1+8+7 — f32's exponent field, truncated significand — so it cannot overflow
-//! anything f32 holds, and is 8x coarser than binary16 in exchange.
+//! 1+8+7 — f32's exponent field, truncated significand — so its range is almost
+//! as wide as f32's and it is 8x coarser than binary16 in exchange. "Almost"
+//! matters: round-to-nearest sends the top roughly 0.2% of f32's positive
+//! finite range, including [`f32::MAX`], to infinity.
 //!
 //! Rust's `f16` is still unstable, and this crate's MSRV is 1.82, so the type
 //! is carried as its bit pattern and converted explicitly. That is not purely a
 //! workaround: every conversion site being visible is what makes the error
 //! analysis in [`crate::tolerance_for_spmv_f16`] auditable.
 //!
-//! # This is a storage format, not an accumulator
+//! # This is a quantisation and compact-storage format, not an accumulator
 //!
 //! binary16 has an 11-bit significand, so its unit roundoff is `2^-11`
 //! (9.8e-4) against f32's `2^-23` (1.2e-7) — a factor of 8192. Accumulating a
 //! 500-term row sum in binary16 admits a relative error near `500 * 4.9e-4`,
 //! about 24%. It also overflows at 65504, which a row sum reaches easily.
 //!
-//! So nothing here accumulates in binary16. Weights are *stored* narrow, then
-//! widened to f32 on load and summed in f32. That buys the bandwidth and keeps
-//! the error bound tractable; see [`crate::tolerance_for_spmv_f16`].
+//! So nothing here accumulates in binary16. Weights are quantised narrow and
+//! summed in f32. Plain Metal SpMV widens its compact buffer on load; CPU and
+//! the other weighted Metal operations read the same quantised values from an
+//! f32 mirror. That keeps the error bound tractable while scoping the bandwidth
+//! saving honestly; see [`crate::tolerance_for_spmv_f16`].
 
 /// Machine epsilon of IEEE binary16: `2^-10`, the ulp at 1.0.
 ///
@@ -192,8 +196,8 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
 /// It is not overflow-*proof*, and an earlier version of this comment claimed
 /// it was. With 7 significand bits the largest finite bfloat16 is 3.3895e38
 /// against f32's 3.4028e38, so f32 values above roughly 3.396e38 — the top
-/// 0.4% of the range — round up to infinity. `f32::MAX` is one of them. The
-/// window is far narrower than binary16's, not absent.
+/// 0.2% of the positive range — round up to infinity. `f32::MAX` is one of
+/// them. The window is far narrower than binary16's, not absent.
 #[inline]
 pub fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();

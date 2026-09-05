@@ -10,7 +10,7 @@
 mod common;
 
 use common::{max_abs, max_abs_term, random_csr, random_vec};
-use sparsl::{available_backends, tolerance_for_spmv, Device, OpError, Rng};
+use sparsl::{available_backends, tolerance_for_spmv, Csr, Device, OpError, Rng};
 
 fn devices() -> Vec<Device> {
     available_backends()
@@ -29,6 +29,41 @@ fn interleave(vectors: &[Vec<f32>], n: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// One exactly representable non-zero per row.
+///
+/// Keeping the arithmetic dyadic makes bit equality a meaningful assertion
+/// across CPU and Metal: this fixture is about the two-dimensional dispatch
+/// geometry and its tail groups, not about reduction-order tolerance.
+fn exact_single_edge_fixture(nrows: usize, ncols: usize) -> (Csr, Vec<f32>) {
+    let adjacency: Vec<Vec<u32>> = (0..nrows)
+        .map(|r| vec![((r * 5 + 1) % ncols) as u32])
+        .collect();
+    let weights = (0..nrows)
+        .map(|r| [0.5f32, -0.25, 1.0, -2.0][r % 4])
+        .collect();
+    (Csr::from_adjacency(&adjacency), weights)
+}
+
+fn exact_batch_input(ncols: usize, n_vec: usize) -> Vec<f32> {
+    (0..ncols * n_vec)
+        .map(|i| {
+            let c = i / n_vec;
+            let v = i % n_vec;
+            (((c * 13 + v * 7) % 17) as i32 - 8) as f32 * 0.125
+        })
+        .collect()
+}
+
+fn exact_batch_seed(nrows: usize, n_vec: usize) -> Vec<f32> {
+    (0..nrows * n_vec)
+        .map(|i| {
+            let r = i / n_vec;
+            let v = i % n_vec;
+            (((r * 11 + v * 3) % 13) as i32 - 6) as f32 * 0.0625
+        })
+        .collect()
 }
 
 #[test]
@@ -197,6 +232,48 @@ fn batch_scratch_survives_a_shrink_then_regrow() {
 }
 
 #[test]
+fn spmm_crosses_threadgroup_width_and_row_tail_boundaries_exactly() {
+    // `MetalDevice::threadgroup_for` selects at most 256 threads. These widths
+    // exercise the final x threadgroup at cap-1, exactly cap, and cap+1 while
+    // 31/32/33 independently straddle the row-grid boundary. At these wide
+    // batches the selected threadgroup is 256x1, so every row is its own y
+    // group; the row cases make a dropped or duplicated grid row visible
+    // without pretending there is a multi-row threadgroup tail. The old
+    // device-backed tests stopped at width eight and observed neither edge.
+    const NCOLS: usize = 7;
+    for &nrows in &[31usize, 32, 33] {
+        let (csr, weights) = exact_single_edge_fixture(nrows, NCOLS);
+        for device in devices() {
+            let op = device
+                .prepare(&csr, NCOLS, &weights)
+                .expect("prepare exact SpMM boundary fixture");
+            for &n_vec in &[255usize, 256, 257] {
+                let x = exact_batch_input(NCOLS, n_vec);
+                let seed = exact_batch_seed(nrows, n_vec);
+                let mut got = seed.clone();
+                op.spmm(&x, n_vec, &mut got)
+                    .expect("SpMM width above one threadgroup must split, not fail");
+
+                for (r, &weight) in weights.iter().enumerate() {
+                    let col = csr.col[csr.row_ptr[r] as usize] as usize;
+                    for v in 0..n_vec {
+                        let i = r * n_vec + v;
+                        let want = seed[i] + weight * x[col * n_vec + v];
+                        assert_eq!(
+                            got[i].to_bits(),
+                            want.to_bits(),
+                            "{}: row-tail nrows={nrows}, width={n_vec}, row={r}, vector={v}: got {} want {want}",
+                            op.label(),
+                            got[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn spmm_rejects_a_zero_batch_and_wrong_lengths() {
     let mut rng = Rng::new(0x0012_345Bu64);
     let (nrows, ncols) = (12usize, 9usize);
@@ -225,4 +302,72 @@ fn spmm_rejects_a_zero_batch_and_wrong_lengths() {
         // And the correct shapes are accepted.
         assert!(op.spmm(&vec![0.0f32; ncols * 3], 3, &mut y).is_ok());
     }
+}
+
+#[test]
+fn spmm_reports_dimension_overflow_truthfully_without_mutating_output() {
+    let device = Device::cpu_sequential();
+
+    let input_overflow = device
+        .prepare(&Csr::from_adjacency(&[Vec::<u32>::new()]), 2, &[])
+        .expect("one empty row over two columns");
+    let mut y = [17.0f32];
+    let y_before = y;
+    let error = input_overflow
+        .spmm(&[], usize::MAX, &mut y)
+        .expect_err("2 * usize::MAX must overflow the input element count");
+    assert_eq!(
+        error,
+        OpError::SizeOverflow {
+            what: "SpMM input element count",
+            lhs: 2,
+            rhs: usize::MAX,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "SpMM input element count overflowed usize: 2 * {}",
+            usize::MAX
+        )
+    );
+    assert_eq!(y, y_before, "input-size refusal mutated the output");
+
+    let output_overflow = device
+        .prepare(&Csr::empty(2), 0, &[])
+        .expect("two empty rows over zero columns");
+    let mut y = [23.0f32];
+    let y_before = y;
+    let error = output_overflow
+        .spmm(&[], usize::MAX, &mut y)
+        .expect_err("2 * usize::MAX must overflow the output element count");
+    assert_eq!(
+        error,
+        OpError::SizeOverflow {
+            what: "SpMM output element count",
+            lhs: 2,
+            rhs: usize::MAX,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "SpMM output element count overflowed usize: 2 * {}",
+            usize::MAX
+        )
+    );
+    assert_eq!(y, y_before, "output-size refusal mutated the output");
+}
+
+#[test]
+fn metal_spmm_uses_wide_address_arithmetic_for_large_batches() {
+    let source = include_str!("../src/kernels/spmv.metal");
+    assert!(
+        source.contains("x[(ulong)col_ind[i] * n_vec + v]"),
+        "SpMM x addressing must widen before multiplying; a uint product can wrap for a valid large matrix"
+    );
+    assert!(
+        source.contains("const ulong out_idx = (ulong)row * n_vec + v"),
+        "SpMM output addressing must widen before multiplying"
+    );
 }

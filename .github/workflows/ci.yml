@@ -12,10 +12,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# A newer push to the same branch supersedes an in-flight run.
+# A newer interactive branch run supersedes its predecessor. Scheduled soaks
+# use a separate group and are never cancelled by a push or by another event.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test:
     name: test / ${{ matrix.os }}
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -52,6 +54,7 @@ jobs:
 
   lint:
     name: fmt + clippy
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -75,7 +78,7 @@ jobs:
   # This job was originally written to build only, on the documented basis that
   # GitHub-hosted macOS runners expose no Metal device. That is out of date: on
   # `macos-26` arm64, `Device::try_new(Backend::Metal)` succeeds — it finds a
-  # device, compiles the MSL library and builds all three pipeline states. The
+  # device, compiles the MSL library and builds all eleven pipeline states. The
   # workflow's own probe step is what caught it, by printing "ran on Metal GPU"
   # where the build-only assumption predicted a fallback to CPU.
   #
@@ -87,6 +90,7 @@ jobs:
   # ---------------------------------------------------------------------------
   metal:
     name: metal / full suite
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -106,7 +110,13 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       - name: Full suite with Metal
-        run: cargo test --features metal --release --all-targets
+        # Serialize GPU work and keep Apple's shader validator fail-closed. The
+        # same configuration is used by the local 4,096-case qualification run.
+        run: cargo test --features metal --release --all-targets -- --test-threads=1
+        env:
+          MTL_SHADER_VALIDATION: "1"
+          MTL_SHADER_VALIDATION_REPORT_TO_STDERR: "1"
+          MTL_SHADER_VALIDATION_ABORT_ON_FAULT: "1"
 
   # ---------------------------------------------------------------------------
   # Bare-metal Apple silicon, for measurement rather than coverage.
@@ -124,17 +134,23 @@ jobs:
   # ---------------------------------------------------------------------------
   metal-bench:
     name: metal / crossover measurement on bare metal
-    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    if: ${{ github.event_name != 'schedule' && vars.HAS_METAL_RUNNER == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --features metal --release --all-targets
+      - run: cargo test --features metal --release --all-targets -- --test-threads=1
       - name: Crossover measurement
         # Not a gate — the numbers land in the job log so a regression in the
-        # CPU/GPU crossover is visible without anyone running it by hand.
-        run: cargo run --release --features metal --example crossover
+        # CPU/GPU crossover is visible without anyone running it by hand. Each
+        # command is correctness-gated and prints its own source/host provenance.
+        run: |
+          cargo run --locked --release --features metal --example crossover
+          cargo run --locked --release --features metal --example narrow_crossover
+          cargo run --locked --release --features metal --example spike_crossover
+          cargo run --locked --release --features metal --example scan_crossover
+          cargo run --locked --release --features metal --example batch_crossover
 
   # ---------------------------------------------------------------------------
   # Cargo.toml claims `rust-version = "1.82"`. Unverified, that is just a string
@@ -142,34 +158,35 @@ jobs:
   #
   # Two deliberate flags, both load-bearing:
   #
-  # `--locked` — without it, Cargo 1.82 re-resolves and pulls a `getrandom` that
-  # needs `edition2024`, failing on a dependency rather than on this crate. The
-  # MSRV claim is about building the shipped lockfile, so the lockfile is what
-  # gets built.
-  #
-  # NOT `--all-targets` — that pulls dev-dependencies, and `proptest` declares
-  # `rust-version = 1.85`. The test suite genuinely needs a newer toolchain than
-  # the library does. `rust-version` is a promise to consumers of the library,
-  # who never build the tests, so this checks what the promise actually covers.
+  # `--locked` is load-bearing: the bounded property-test dependency is pinned
+  # to the final rand-0.8 line, avoiding a target-only edition-2024 manifest
+  # that Cargo 1.82 cannot parse. Metadata is checked explicitly because a
+  # host-target build can skip parsing an unused target dependency. Unlike the
+  # old gate, the compile checks include every target and dev-dependency.
   # ---------------------------------------------------------------------------
   msrv:
-    name: MSRV 1.82 (library)
+    name: MSRV 1.82 / locked graph + all targets
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.82.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked
-      - run: cargo check --locked --features metal
+      - run: cargo metadata --locked --format-version 1 > /dev/null
+      - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-features --all-targets
 
   # ---------------------------------------------------------------------------
   # Soak. Scheduled and manual only — too slow for every push.
   #
-  # The per-push fuzz runs 48 random shapes so it stays fast. That is enough to
-  # catch a broken kernel and nowhere near enough to trust the tail. This runs
-  # 50,000, and repeats the whole suite to catch anything intermittent: the
-  # concurrency test and the GPU dispatch paths are where a flake would hide,
-  # and a flake that appears once in fifty runs is a real defect, not noise.
+  # The per-push multi-operation fuzz runs 48 generated cases so it stays fast,
+  # choosing one of nine operation families per case; a deterministic sentinel
+  # still executes every family. That is enough to catch a broken kernel and
+  # nowhere near enough to trust the tail. This runs 50,000 total randomized
+  # operations (not 50,000 of each), and repeats the whole suite to catch
+  # anything intermittent: the concurrency test and the GPU dispatch paths are
+  # where a flake would hide, and a flake that appears once in fifty runs is a
+  # real defect, not noise.
   # ---------------------------------------------------------------------------
   soak:
     name: soak (scheduled)
@@ -179,14 +196,20 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Differential fuzz, 50k random shapes
+      - name: Differential fuzz, 50k randomized operations and shapes
         env:
           PROPTEST_CASES: 50000
-        run: cargo test --features metal --release --test differential
+          MTL_SHADER_VALIDATION: "1"
+          MTL_SHADER_VALIDATION_REPORT_TO_STDERR: "1"
+          MTL_SHADER_VALIDATION_ABORT_ON_FAULT: "1"
+        run: cargo test --features metal --release --test differential -- --test-threads=1
       - name: Repeat the full suite to surface intermittents
         run: |
           for i in $(seq 1 12); do
             echo "::group::run $i"
-            cargo test --features metal --release --all-targets
+            MTL_SHADER_VALIDATION=1 \
+              MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
+              MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 \
+              cargo test --features metal --release --all-targets -- --test-threads=1
             echo "::endgroup::"
           done

@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{max_abs, max_abs_term, random_csr, random_vec};
+use common::{max_abs, max_abs_term, max_col_nnz, random_csr, random_vec};
 use sparsl::{available_backends, tolerance_for_spmv, Device, OpError, Rng};
 
 /// `⟨a, b⟩` in f64, so the identity is judged at higher precision than the
@@ -97,7 +97,7 @@ fn transpose_matches_a_dense_reference() {
         op.spmv_t(&x, &mut got).expect("spmv_t");
 
         let tol = tolerance_for_spmv(
-            op.shape().max_row_nnz().max(1),
+            max_col_nnz(&csr, ncols),
             max_abs_term(&weights, &x),
             max_abs(&want),
         );

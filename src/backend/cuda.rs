@@ -29,8 +29,8 @@
 //! 2. Add `CudaDevice` / `CudaSparse` here, mirroring
 //!    the crate-private `backend::metal` module: `open()`, `prepare()`, `spmv()`,
 //!    `lif_integrate()`, `fused_spmv_lif()`.
-//! 3. Port `src/kernels/spmv.metal` to CUDA C. The three kernels are small and
-//!    the bounds-guard contract is identical; `SparseOp::prepare` already
+//! 3. Port the eleven kernels in `src/kernels/spmv.metal` to CUDA C. Their
+//!    bounds-guard contract is identical; `SparseOp::prepare` already
 //!    guarantees `col[i] < ncols` before upload, so the column indexing needs
 //!    no in-kernel range check on CUDA either.
 //! 4. Add `DeviceInner::Cuda` / `OpResident::Cuda` arms in

@@ -1,11 +1,11 @@
-//! Narrow weight storage — binary16 and bfloat16 — across backends.
+//! Resident weight quantisation — binary16 and bfloat16 — across backends.
 //!
 //! Two distinct claims, easy to conflate:
 //!
-//! * **The host encoders agree with Metal.** The host narrows and uploads raw
-//!   `u16`; the kernels declare that same memory as `half` or `bfloat`. If the
-//!   two spellings disagreed the kernel would silently read different weights,
-//!   so this is checked rather than assumed.
+//! * **The host encoders agree with Metal.** For plain Metal SpMV, preparation
+//!   uploads raw `u16`; the compact kernels declare that same memory as `half`
+//!   or `bfloat`. If the two spellings disagreed the kernel would silently read
+//!   different weights, so this is checked rather than assumed.
 //! * **The quantisation error is bounded by what the crate promises.**
 //!   `tolerance_for_spmv_narrow` claims to bound a narrow operator against the
 //!   answer the unquantised weights would have given.
