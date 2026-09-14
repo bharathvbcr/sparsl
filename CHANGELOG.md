@@ -6,6 +6,20 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-14
+
+The Metal kernel release. The minor version moves rather than the patch
+because this is a breaking change: `RowKernel` gained a `Vec8` tier and
+`OpError`/`SparsePlanError` gained variants, so exhaustive downstream matches
+on those enums no longer compile. Nothing else in the public API changed, and
+the numeric contract is unchanged — within a backend the packed-spike path
+stays bit-identical to the dense product and SpMM columns to SpMV; across
+backends comparisons still take `tolerance_for_spmv`.
+
+Verified on this release commit, on an M5 Pro: `cargo test --release
+--features metal` (154 tests), the CPU-only suite (130 tests), `clippy
+-D warnings` with and without `metal`, and `cargo fmt --check` — all clean.
+
 ### Changed
 
 - **Metal line-parallel kernels come in three lane widths from one template.**
@@ -363,4 +377,6 @@ why each piece landed.
 - Canary sentinel buffers around every Metal allocation, and a golden output
   fingerprint pinned across releases.
 
+[0.2.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.2.0
+[0.1.1]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.0

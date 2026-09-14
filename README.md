@@ -20,7 +20,7 @@ Extracted from the numeric core of a spiking-network research harness. The kerne
 
 | | |
 | --- | --- |
-| **Status** | [`0.1.1`](https://crates.io/crates/sparsl) — Metal verified, CUDA declared but unavailable |
+| **Status** | [`0.2.0`](https://crates.io/crates/sparsl) — Metal verified, CUDA declared but unavailable |
 | **API docs** | [docs.rs/sparsl](https://docs.rs/sparsl) — built on `aarch64-apple-darwin` with `--features metal`, so the Metal backend is documented rather than cfg'd away |
 | **Tests** | CPU-only and Metal-enabled release suites, plus a 20-case mutation campaign; the inventory below avoids aggregate counts that drift as hardening tests land |
 | **Platform** | Any CPU; Metal on macOS behind `--features metal` |
@@ -639,12 +639,11 @@ Re-verification after the fixes: every former survivor is now caught.
 
 ## 🧭 Known gaps
 
-Recorded rather than implied. **SpMM shipped** — see [The batched product](#the-batched-product). The **`block 0.1.6`** entry is gone too: the Metal backend now uses `objc2-metal`, which does not depend on it, so the future-incompatibility lint that would have become a hard error no longer applies.
+Recorded rather than implied. **SpMM shipped** — see [The batched product](#the-batched-product). The **`block 0.1.6`** entry is gone too: the Metal backend now uses `objc2-metal`, which does not depend on it, so the future-incompatibility lint that would have become a hard error no longer applies. **Next release compatibility** is resolved: the added `RowKernel::Vec8`, `OpError` and `SparsePlanError` variants do break exhaustive downstream matches, so `0.2.0` moves the minor version rather than the patch. See [CHANGELOG.md](CHANGELOG.md).
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **CUDA** | `Backend::Cuda` is declared and permanently unavailable. | Deliberate. See `src/backend/cuda.rs`: it refuses rather than silently falling back to CPU under a GPU label. |
-| **Next release compatibility** | `OpError::Execution` exposes terminal failures and timeouts, `OpError::SizeOverflow` exposes checked shape-product failure, and `SparsePlanError::Backend` exposes a quarantined device during preparation, but adding public enum variants breaks exhaustive downstream matches. | The code is unreleased. Publishing it under the existing `0.1.1` identity requires an explicit compatibility/version decision; this task does not publish. |
 
 ---
 
