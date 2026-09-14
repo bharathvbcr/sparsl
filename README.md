@@ -1,6 +1,12 @@
-# sparsl
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/png/logo-dark@900.png">
+    <img src="assets/png/logo@900.png" alt="sparsl" width="420">
+  </picture>
+</p>
 
 <p align="center">
+  <a href="https://sparsl.vbcr.dev/"><img src="https://img.shields.io/badge/website-sparsl.vbcr.dev-10B981?style=flat&logo=safari&logoColor=white" alt="Website"></a>
   <a href="https://crates.io/crates/sparsl"><img src="https://img.shields.io/crates/v/sparsl.svg" alt="crates.io"></a>
   <a href="https://docs.rs/sparsl"><img src="https://img.shields.io/docsrs/sparsl" alt="docs.rs"></a>
   <a href="https://github.com/bharathvbcr/sparsl/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/sparsl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -8,6 +14,7 @@
 </p>
 
 <p align="center">
+  <a href="https://sparsl.vbcr.dev/"><strong>Interactive CSR Showcase (sparsl.vbcr.dev)</strong></a> ·
   <a href="https://docs.rs/sparsl"><strong>API documentation</strong></a> ·
   <a href="https://crates.io/crates/sparsl"><strong>crates.io</strong></a> ·
   <a href="CHANGELOG.md">Changelog</a> ·

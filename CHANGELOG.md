@@ -6,6 +6,19 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A mark of its own, and the showcase at
+  [sparsl.vbcr.dev](https://sparsl.vbcr.dev/) linked from the README.** The crate
+  had no art: the project site fell back to an authored stand-in motif and the
+  GitHub profile card to a generic Rust shield. `assets/` now holds the vector
+  source, the icon ladder, both wordmark lockups and the script that regenerates
+  them, on the same plate geometry tessl uses so the two read as siblings — a
+  4×4 grid with five stored entries threaded row-major over `col_indices`,
+  skipping what the format never stored. `homepage` is declared in `Cargo.toml`,
+  so the crate page links the showcase in its own sidebar rather than only from
+  the rendered README.
+
 ## [0.2.0] — 2026-09-14
 
 The Metal kernel release. The minor version moves rather than the patch
