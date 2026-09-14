@@ -6,6 +6,13 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-14
+
+Documentation and brand assets only. No code, API or behaviour change; the
+compiled crate is identical to 0.2.0. It ships because `README.md` is what
+crates.io renders and `homepage` is what it links in the sidebar — neither
+reaches a reader of the crate page without a published version carrying them.
+
 ### Added
 
 - **A mark of its own, and the showcase at
@@ -390,6 +397,7 @@ why each piece landed.
 - Canary sentinel buffers around every Metal allocation, and a golden output
   fingerprint pinned across releases.
 
+[0.2.1]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.2.1
 [0.2.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.2.0
 [0.1.1]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.0

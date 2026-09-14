@@ -27,7 +27,7 @@ Extracted from the numeric core of a spiking-network research harness. The kerne
 
 | | |
 | --- | --- |
-| **Status** | [`0.2.0`](https://crates.io/crates/sparsl) — Metal verified, CUDA declared but unavailable |
+| **Status** | [`0.2.1`](https://crates.io/crates/sparsl) — Metal verified, CUDA declared but unavailable |
 | **API docs** | [docs.rs/sparsl](https://docs.rs/sparsl) — built on `aarch64-apple-darwin` with `--features metal`, so the Metal backend is documented rather than cfg'd away |
 | **Tests** | CPU-only and Metal-enabled release suites, plus a 20-case mutation campaign; the inventory below avoids aggregate counts that drift as hardening tests land |
 | **Platform** | Any CPU; Metal on macOS behind `--features metal` |
