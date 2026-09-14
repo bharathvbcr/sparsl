@@ -378,5 +378,4 @@ why each piece landed.
   fingerprint pinned across releases.
 
 [0.2.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.2.0
-[0.1.1]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.0
