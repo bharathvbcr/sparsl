@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fail closed before tag / cargo publish / GitHub Release.
 # Catches version triad drift, dirty trees, and oversized/stale package contents.
+# Portable: uses python3 + grep/sed only (no ripgrep) so GitHub runners work.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,25 +20,47 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-readme_ver="$(rg -oN '\*\*Status\*\* \| \[`([0-9]+\.[0-9]+\.[0-9]+)`\]' -r '$1' README.md | head -1 || true)"
+readme_ver="$(
+  python3 - <<'PY'
+import pathlib, re, sys
+text = pathlib.Path("README.md").read_text()
+m = re.search(r"\*\*Status\*\* \| \[`([0-9]+\.[0-9]+\.[0-9]+)`\]", text)
+sys.stdout.write(m.group(1) if m else "")
+PY
+)"
 if [[ "$readme_ver" != "$version" ]]; then
   echo "error: README Status is '${readme_ver:-<missing>}' but Cargo.toml is '$version'" >&2
   exit 1
 fi
 
-changelog_ver="$(rg -oN '^## \[([0-9]+\.[0-9]+\.[0-9]+)\]' -r '$1' CHANGELOG.md | head -1 || true)"
+changelog_ver="$(
+  python3 - <<'PY'
+import pathlib, re, sys
+text = pathlib.Path("CHANGELOG.md").read_text()
+m = re.search(r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", text, re.M)
+sys.stdout.write(m.group(1) if m else "")
+PY
+)"
 if [[ "$changelog_ver" != "$version" ]]; then
   echo "error: newest CHANGELOG version is '${changelog_ver:-<missing>}' but Cargo.toml is '$version'" >&2
   exit 1
 fi
 
-if ! rg -q "^\[$version\]:" CHANGELOG.md; then
+if ! grep -q "^\[${version}\]:" CHANGELOG.md; then
   echo "error: CHANGELOG.md missing footer link [$version]:" >&2
   exit 1
 fi
 
 if [[ -f Cargo.lock ]]; then
-  lock_ver="$(rg -n -A2 "^name = \"$crate\"$" Cargo.lock | rg -oN 'version = "([^"]+)"' -r '$1' | head -1 || true)"
+  lock_ver="$(
+    CRATE="$crate" python3 - <<'PY'
+import os, pathlib, re, sys
+text = pathlib.Path("Cargo.lock").read_text()
+crate = os.environ["CRATE"]
+m = re.search(rf'^name = "{re.escape(crate)}"\nversion = "([^"]+)"', text, re.M)
+sys.stdout.write(m.group(1) if m else "")
+PY
+  )"
   if [[ -n "$lock_ver" && "$lock_ver" != "$version" ]]; then
     echo "error: Cargo.lock has $crate $lock_ver but Cargo.toml is $version" >&2
     exit 1
@@ -46,9 +69,8 @@ fi
 
 echo "==> cargo package --locked --list ($crate $version)"
 cargo package --locked --list >"/tmp/${crate}-package.list"
-if rg -q '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "/tmp/${crate}-package.list"; then
-  echo "error: package list contains excluded/stale paths:" >&2
-  rg '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "/tmp/${crate}-package.list" >&2
+if grep -E '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "/tmp/${crate}-package.list"; then
+  echo "error: package list contains excluded/stale paths (listed above)" >&2
   exit 1
 fi
 

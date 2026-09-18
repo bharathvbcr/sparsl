@@ -69,7 +69,7 @@ jobs:
           if cargo publish --locked 2>&1 | tee /tmp/publish.log; then
             exit 0
           fi
-          if rg -q 'already uploaded|crate version .* already exists' /tmp/publish.log; then
+          if grep -Eq 'already uploaded|crate version .* already exists' /tmp/publish.log; then
             echo "version already on crates.io — treating as success"
             exit 0
           fi
