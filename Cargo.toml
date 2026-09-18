@@ -1,6 +1,6 @@
 [package]
 name = "sparsl"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Deterministic sparse + scan compute kernels for event-driven simulation, with fail-closed CPU/GPU backends"
@@ -11,6 +11,17 @@ readme = "README.md"
 keywords = ["sparse", "spmv", "simd", "metal", "deterministic"]
 categories = ["science", "algorithms", "hardware-support"]
 license = "MIT OR Apache-2.0"
+
+# Logo exploration rasters and the generator are design history in git, not
+# cargo-package payload. Mirror tessl's exclude so a future @2048 / concepts
+# tree cannot inflate the .crate the way tessl's did before the denylist.
+exclude = [
+    "assets/concepts/**",
+    "assets/build_logo.py",
+    "assets/png/*@2048.png",
+    ".devmap/**",
+]
+
 
 # The Metal backend is `cfg(all(target_os = "macos", feature = "metal"))`, so a
 # default x86_64-linux docs build would render the crate with `Backend::Metal`
@@ -67,6 +78,7 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTLLibrary",
     "MTLResource",
     "MTLTypes",
+    "MTLGPUAddress",
 ] }
 
 [dev-dependencies]

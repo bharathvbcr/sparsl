@@ -1,3 +1,10 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# devmap's code-index cache. Regenerated on demand; must never enter a .crate
+# (cargo package --allow-dirty previously would have shipped ~7MB of sqlite).
+.devmap/
+
+.DS_Store
+__pycache__/

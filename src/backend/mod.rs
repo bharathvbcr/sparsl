@@ -25,6 +25,7 @@
 //! code.
 
 use core::fmt;
+use std::sync::Mutex;
 
 use crate::scan::State;
 use crate::sparse::{Csc, Csr};
@@ -156,6 +157,39 @@ impl fmt::Display for BackendUnavailable {
 
 impl std::error::Error for BackendUnavailable {}
 
+/// Why [`Device::reset_metal`] refused to clear Metal quarantine or rebuild the
+/// submission path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetalResetError {
+    /// At least one submission is still holding an admission permit.
+    ActiveAdmissions { count: usize },
+    /// A previously timed-out command buffer has not reached a terminal status.
+    NonTerminalCommand,
+    /// Opening or rebuilding Metal failed.
+    Backend(&'static str),
+    /// Metal is not part of this build or not available on this host.
+    Unavailable(&'static str),
+}
+
+impl fmt::Display for MetalResetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ActiveAdmissions { count } => write!(
+                f,
+                "Metal reset refused: {count} active admission(s) still outstanding"
+            ),
+            Self::NonTerminalCommand => write!(
+                f,
+                "Metal reset refused: a timed-out command buffer is still non-terminal"
+            ),
+            Self::Backend(reason) => write!(f, "Metal reset failed: {reason}"),
+            Self::Unavailable(reason) => write!(f, "Metal reset unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for MetalResetError {}
+
 /// Backends that can actually execute right now, in a stable order.
 ///
 /// A benchmark driven by this can never emit a two-arm table whose arms are
@@ -255,6 +289,10 @@ pub enum SparsePlanError {
     /// of arbitrary device memory, which is why it is rejected before upload
     /// rather than checked per non-zero inside the kernel.
     ColumnOutOfRange { edge: usize, col: u32, ncols: usize },
+    /// Column indices within a row decreased (duplicates are allowed).
+    RowUnsorted { row: usize, edge: usize },
+    /// The CSR's stored column count disagreed with the `ncols` passed to prepare.
+    NcolsMismatch { stored: usize, declared: usize },
     /// The shape does not fit the `u32` indices the GPU kernels use.
     TooLarge { what: &'static str, value: usize },
     /// `weights` did not have one entry per stored non-zero.
@@ -282,6 +320,14 @@ impl fmt::Display for SparsePlanError {
             Self::ColumnOutOfRange { edge, col, ncols } => write!(
                 f,
                 "CSR column index {col} at edge {edge} is out of range (ncols = {ncols})"
+            ),
+            Self::RowUnsorted { row, edge } => write!(
+                f,
+                "CSR row {row} is unsorted at edge {edge} (columns must be non-decreasing)"
+            ),
+            Self::NcolsMismatch { stored, declared } => write!(
+                f,
+                "CSR ncols {stored} does not match prepare ncols {declared}"
             ),
             Self::TooLarge { what, value } => {
                 write!(
@@ -753,6 +799,8 @@ impl DeviceInner {
 /// Cloning is cheap; GPU state is shared, not duplicated. A Metal command
 /// timeout dynamically quarantines that backend, after which existing handles
 /// fail closed rather than reusing resources that may still be in flight.
+/// [`Device::reset_metal`] clears that quarantine only when no admissions are
+/// outstanding and every timed-out command buffer is terminal.
 #[derive(Clone)]
 pub struct Device {
     backend: Backend,
@@ -774,6 +822,26 @@ impl Default for Device {
 }
 
 impl Device {
+    /// Clear Metal quarantine and rebuild the shared submission path.
+    ///
+    /// Succeeds only when no admission permits are outstanding and every
+    /// timed-out command buffer is terminal. On success the quarantine bit is
+    /// cleared and the shared device's command queue plus completion event are
+    /// replaced. If a timed-out command is still non-terminal, quarantine stays
+    /// published.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn reset_metal() -> Result<(), MetalResetError> {
+        metal::reset_runtime()
+    }
+
+    /// Metal is not part of this build.
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    pub fn reset_metal() -> Result<(), MetalResetError> {
+        Err(MetalResetError::Unavailable(
+            metal_unavailable_reason().unwrap_or("Metal is unavailable"),
+        ))
+    }
+
     /// Multi-threaded CPU. Infallible.
     pub fn cpu_parallel() -> Self {
         Self {
@@ -1034,14 +1102,42 @@ impl Device {
         ncols: usize,
         weights: &[f32],
     ) -> Result<SparseOp, SparsePlanError> {
-        SparseOp::prepare(
-            self.clone(),
-            csr,
-            ncols,
-            weights,
-            true,
-            WeightPrecision::F32,
-        )
+        self.prepare_with_transpose_precision(csr, ncols, weights, WeightPrecision::F32)
+    }
+
+    /// [`Device::prepare_with_transpose`] at an explicit weight precision.
+    ///
+    /// The named [`Device::prepare_f16_with_transpose`] /
+    /// [`Device::prepare_bf16_with_transpose`] wrappers exist for call sites
+    /// that know the format; reach for this when precision is a variable.
+    pub fn prepare_with_transpose_precision(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+        precision: WeightPrecision,
+    ) -> Result<SparseOp, SparsePlanError> {
+        SparseOp::prepare(self.clone(), csr, ncols, weights, true, precision)
+    }
+
+    /// Narrow binary16 weights plus the reverse index [`SparseOp::spmv_t`] needs.
+    pub fn prepare_f16_with_transpose(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+    ) -> Result<SparseOp, SparsePlanError> {
+        self.prepare_with_transpose_precision(csr, ncols, weights, WeightPrecision::F16)
+    }
+
+    /// Narrow bfloat16 weights plus the reverse index [`SparseOp::spmv_t`] needs.
+    pub fn prepare_bf16_with_transpose(
+        &self,
+        csr: &Csr,
+        ncols: usize,
+        weights: &[f32],
+    ) -> Result<SparseOp, SparsePlanError> {
+        self.prepare_with_transpose_precision(csr, ncols, weights, WeightPrecision::Bf16)
     }
 
     /// Inclusive scan over affine maps, on this device's substrate.
@@ -1147,9 +1243,33 @@ enum OpResident {
         /// the index memory of every forward-only caller, which is most of
         /// them.
         csc: Option<Csc>,
+        /// Host scratch mirroring the Metal resident buffers so the write /
+        /// resident / sync API is backend-agnostic.
+        scratch: Mutex<CpuScratch>,
     },
     #[cfg(all(target_os = "macos", feature = "metal"))]
     Metal(metal::MetalSparse),
+}
+
+/// CPU-side resident operands for the write / step / sync API.
+struct CpuScratch {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    v: Vec<f32>,
+    theta: Vec<f32>,
+    spikes: Vec<bool>,
+}
+
+impl CpuScratch {
+    fn new(shape: SparseShape) -> Self {
+        Self {
+            x: vec![0.0; shape.ncols()],
+            y: vec![0.0; shape.nrows()],
+            v: vec![0.0; shape.nrows()],
+            theta: vec![0.0; shape.nrows()],
+            spikes: vec![false; shape.nrows()],
+        }
+    }
 }
 
 /// A CSR operator validated against `ncols` and bound to a device.
@@ -1219,7 +1339,7 @@ impl SparseOp {
                 // divergence between the two checks surfaces as the error the
                 // caller already handles, not as a panic from inside `prepare`.
                 let (edge, col) = csr
-                    .col
+                    .col()
                     .iter()
                     .enumerate()
                     .find(|(_, c)| **c as usize >= ncols)
@@ -1233,6 +1353,7 @@ impl SparseOp {
                 csr: csr.clone(),
                 weights: weights.to_vec(),
                 csc,
+                scratch: Mutex::new(CpuScratch::new(shape)),
             },
             #[cfg(all(target_os = "macos", feature = "metal"))]
             DeviceInner::Metal(d) => {
@@ -1511,46 +1632,367 @@ impl SparseOp {
             OpResident::Metal(op) => op.fused_spmv_lif(x, v, theta, spikes, params),
         }
     }
+
+    /// Upload `x` into resident scratch without dispatching.
+    ///
+    /// Pair with [`SparseOp::spmv_resident`] / [`SparseOp::fused_spmv_lif_resident`]
+    /// and an explicit [`SparseOp::sync_y`] / [`SparseOp::sync_lif_state`] so a
+    /// BINN tick loop does not memcpy operands every step.
+    pub fn write_x(&self, x: &[f32]) -> Result<(), OpError> {
+        require_min_len("x", x.len(), self.shape.ncols())?;
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                s.x[..self.shape.ncols()].copy_from_slice(&x[..self.shape.ncols()]);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.write_x(x),
+        }
+    }
+
+    /// Upload `y` into resident scratch without dispatching.
+    pub fn write_y(&self, y: &[f32]) -> Result<(), OpError> {
+        require_len("y", y.len(), self.shape.nrows())?;
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                s.y.copy_from_slice(y);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.write_y(y),
+        }
+    }
+
+    /// Upload LIF membrane state into resident scratch without dispatching.
+    pub fn write_lif_state(&self, v: &[f32], theta: &[f32]) -> Result<(), OpError> {
+        require_len("v", v.len(), self.shape.nrows())?;
+        require_len("theta", theta.len(), self.shape.nrows())?;
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                s.v.copy_from_slice(v);
+                s.theta.copy_from_slice(theta);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.write_lif_state(v, theta),
+        }
+    }
+
+    /// `y += A · x` using resident scratch; no host readback of `y`.
+    pub fn spmv_resident(&self) -> Result<(), OpError> {
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu {
+                csr,
+                weights,
+                scratch,
+                ..
+            } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                // Split the struct borrow so `x` can be shared while `y` mutates.
+                let CpuScratch {
+                    x: ref x_res,
+                    y: ref mut y_res,
+                    ..
+                } = &mut *s;
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_spmv_parallel(csr, weights, x_res, y_res);
+                } else {
+                    cpu_spmv_sequential(csr, weights, x_res, y_res);
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.spmv_resident(),
+        }
+    }
+
+    /// Fused SpMV+LIF on resident scratch; no host readback.
+    ///
+    /// This is the BINN tick path: upload state once, step many times, sync
+    /// when the host needs the result.
+    pub fn fused_spmv_lif_resident(&self, params: LifParams) -> Result<(), OpError> {
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu {
+                csr,
+                weights,
+                scratch,
+                ..
+            } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                let CpuScratch {
+                    x: ref x_res,
+                    v: ref mut v_res,
+                    theta: ref mut th_res,
+                    spikes: ref mut sp_res,
+                    ..
+                } = &mut *s;
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_fused_parallel(csr, weights, x_res, v_res, th_res, sp_res, params);
+                } else {
+                    cpu_fused_sequential(csr, weights, x_res, v_res, th_res, sp_res, params);
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.fused_spmv_lif_resident(params),
+        }
+    }
+
+    /// Canary check (Metal) + read resident `y` back to the host.
+    pub fn sync_y(&self, y: &mut [f32]) -> Result<(), OpError> {
+        require_len("y", y.len(), self.shape.nrows())?;
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                y.copy_from_slice(&s.y);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.sync_y(y),
+        }
+    }
+
+    /// Canary check (Metal) + read resident LIF state back to the host.
+    pub fn sync_lif_state(
+        &self,
+        v: &mut [f32],
+        theta: &mut [f32],
+        spikes: &mut [bool],
+    ) -> Result<(), OpError> {
+        require_len("v", v.len(), self.shape.nrows())?;
+        require_len("theta", theta.len(), self.shape.nrows())?;
+        require_len("spikes", spikes.len(), self.shape.nrows())?;
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                v.copy_from_slice(&s.v);
+                theta.copy_from_slice(&s.theta);
+                spikes.copy_from_slice(&s.spikes);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.sync_lif_state(v, theta, spikes),
+        }
+    }
+
+    /// Bind a caller-owned `MTLBuffer` as SpMV `x` (Metal only; no host copy).
+    ///
+    /// See [`crate::backend::metal`] module docs for the SharedEvent handoff
+    /// pattern with tessl. Length must cover `ncols` f32s; device `registryID`
+    /// must match. CSR/weights stay on the prepared resident path.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn bind_mtl_x(
+        &self,
+        buffer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    ) -> Result<(), OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.bind_mtl_x(buffer),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "bind_mtl_x requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Bind a caller-owned `MTLBuffer` as SpMV `y` (Metal only; no host copy).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn bind_mtl_y(
+        &self,
+        buffer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    ) -> Result<(), OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.bind_mtl_y(buffer),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "bind_mtl_y requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Clear an external `x` binding.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn unbind_mtl_x(&self) -> Result<(), OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.unbind_mtl_x(),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "unbind_mtl_x requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Clear an external `y` binding.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn unbind_mtl_y(&self) -> Result<(), OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.unbind_mtl_y(),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "unbind_mtl_y requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// GPU address of the active `x` buffer (external or owned scratch).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn mtl_x_gpu_address(&self) -> Result<u64, OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.mtl_x_gpu_address(),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "mtl_x_gpu_address requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// GPU address of the active `y` buffer (external or owned scratch).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn mtl_y_gpu_address(&self) -> Result<u64, OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.mtl_y_gpu_address(),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "mtl_y_gpu_address requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Allocate a shared f32 `MTLBuffer` on this operator's Metal device.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn alloc_mtl_f32(
+        &self,
+        data: &[f32],
+    ) -> Result<
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        OpError,
+    > {
+        match &self.resident {
+            OpResident::Metal(op) => op.alloc_mtl_f32(data),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "alloc_mtl_f32 requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Wait on a peer `MTLSharedEvent` (e.g. tessl's) before reading shared
+    /// buffers. Queues are not merged across crates.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn wait_shared_event(
+        &self,
+        event: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+        timeout_ms: u64,
+    ) -> Result<(), OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.wait_shared_event(event, value, timeout_ms),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "wait_shared_event requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Host-signal a peer `MTLSharedEvent` after this operator's work completed.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn signal_shared_event(
+        &self,
+        event: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), OpError> {
+        match &self.resident {
+            OpResident::Metal(op) => op.signal_shared_event(event, value),
+            OpResident::Cpu { .. } => Err(OpError::Backend {
+                reason: "signal_shared_event requires a Metal SparseOp",
+            }),
+        }
+    }
+
+    /// Test-only: whether the Metal forward path split on degree skew.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn is_hybrid_forward(&self) -> bool {
+        match &self.resident {
+            OpResident::Metal(op) => op.is_hybrid_forward(),
+            _ => false,
+        }
+    }
 }
 
 /// Full structural validation of a CSR against a declared column count.
 ///
 /// Re-validates everything [`Csr::from_parts`] checks, because
-/// `Csr::from_parts_unchecked` exists and a caller may have used it, plus the
-/// column-range check that `Csr` itself cannot make without knowing `ncols`.
+/// `Csr::from_parts_unchecked` exists and a caller may have used it. Also
+/// cross-checks `csr.ncols() == ncols` so a trailing-empty-column CSR cannot
+/// be prepared under a narrower width.
 fn validate_csr(csr: &Csr, ncols: usize) -> Result<SparseShape, SparsePlanError> {
-    if csr.row_ptr.is_empty() {
+    let row_ptr = csr.row_ptr();
+    let col = csr.col();
+    if row_ptr.is_empty() {
         return Err(SparsePlanError::EmptyRowPtr);
     }
-    if csr.row_ptr[0] != 0 {
+    if row_ptr[0] != 0 {
         return Err(SparsePlanError::NonZeroStart {
-            start: csr.row_ptr[0],
+            start: row_ptr[0],
         });
     }
-    for i in 1..csr.row_ptr.len() {
-        if csr.row_ptr[i] < csr.row_ptr[i - 1] {
+    for i in 1..row_ptr.len() {
+        if row_ptr[i] < row_ptr[i - 1] {
             return Err(SparsePlanError::NotMonotonic { index: i });
         }
     }
-    let end = *csr.row_ptr.last().expect("row_ptr checked non-empty");
-    if end as usize != csr.col.len() {
+    let end = *row_ptr.last().expect("row_ptr checked non-empty");
+    if end as usize != col.len() {
         return Err(SparsePlanError::NnzMismatch {
             row_ptr_end: end,
-            col_len: csr.col.len(),
+            col_len: col.len(),
         });
     }
-    for (edge, &col) in csr.col.iter().enumerate() {
-        if col as usize >= ncols {
-            return Err(SparsePlanError::ColumnOutOfRange { edge, col, ncols });
+    if csr.ncols() != ncols {
+        return Err(SparsePlanError::NcolsMismatch {
+            stored: csr.ncols(),
+            declared: ncols,
+        });
+    }
+    for (edge, &c) in col.iter().enumerate() {
+        if c as usize >= ncols {
+            return Err(SparsePlanError::ColumnOutOfRange {
+                edge,
+                col: c,
+                ncols,
+            });
+        }
+    }
+    for row in 0..row_ptr.len().saturating_sub(1) {
+        let start = row_ptr[row] as usize;
+        let end = row_ptr[row + 1] as usize;
+        for edge in start.saturating_add(1)..end {
+            if col[edge] < col[edge - 1] {
+                return Err(SparsePlanError::RowUnsorted { row, edge });
+            }
         }
     }
 
-    let nrows = csr.row_ptr.len() - 1;
-    let nnz = csr.col.len();
+    let nrows = row_ptr.len() - 1;
+    let nnz = col.len();
     // Monotonicity is already established above, so every difference is
     // non-negative and this cannot underflow.
     let max_row_nnz = (0..nrows)
-        .map(|r| (csr.row_ptr[r + 1] - csr.row_ptr[r]) as usize)
+        .map(|r| (row_ptr[r + 1] - row_ptr[r]) as usize)
         .max()
         .unwrap_or(0);
     for (what, value) in [("nrows", nrows), ("ncols", ncols), ("nnz", nnz)] {
@@ -1571,13 +2013,83 @@ fn validate_csr(csr: &Csr, ncols: usize) -> Result<SparseShape, SparsePlanError>
 // CPU kernels
 // ---------------------------------------------------------------------------
 
+/// Contiguous line ranges with roughly equal total nnz.
+///
+/// `ptr` is a CSR `row_ptr` or CSC `col_ptr` (`n + 1` entries). Each range is
+/// a half-open `[start, end)` over lines. Whole lines are never split, so a
+/// single hub longer than `total / parts` occupies one part by itself — the
+/// remaining parts then balance the leftover work instead of leaving every
+/// other Rayon worker on a two-edge leaf.
+fn nnz_balanced_partitions(ptr: &[u32], parts: usize) -> Vec<(usize, usize)> {
+    let n = ptr.len().saturating_sub(1);
+    if n == 0 {
+        return Vec::new();
+    }
+    let parts = parts.clamp(1, n);
+    let mut out = Vec::with_capacity(parts);
+    let mut start = 0usize;
+    for p in 0..parts {
+        if start >= n {
+            break;
+        }
+        let parts_left = parts - p;
+        if parts_left == 1 {
+            out.push((start, n));
+            break;
+        }
+        let nnz_left = (ptr[n] - ptr[start]) as usize;
+        let target = nnz_left.div_ceil(parts_left);
+        let mut end = start + 1;
+        while end < n && ((ptr[end] - ptr[start]) as usize) < target {
+            end += 1;
+        }
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// How many nnz-balanced parts to spawn per Rayon worker.
+///
+/// One part per worker balances hub rows but freezes the plan: Rayon cannot
+/// steal unfinished lines from a slow core. On heterogeneous pools (Apple
+/// P+E) that turns the wall time into the slowest E-core's share. Measured on
+/// M5 Pro (6P+12E), uniform SpMV at n=20k: 18 parts → 1.47 ms vs adaptive
+/// per-row `par_iter` at 1.12 ms; 16× oversubscribe recovers to ~1.05 ms while
+/// still keeping hub rows in their own part. Partition *build* cost is ~5 µs
+/// and is not the regression.
+const PARALLEL_PARTS_PER_WORKER: usize = 16;
+
+/// Partition count for a parallel line walk: nnz-balanced parts with enough
+/// oversubscribe for work-stealing, capped by the number of lines.
+fn parallel_line_partitions(ptr: &[u32], lines: usize) -> Vec<(usize, usize)> {
+    let workers = rayon::current_num_threads().max(1);
+    let parts = workers
+        .saturating_mul(PARALLEL_PARTS_PER_WORKER)
+        .clamp(1, lines.max(1));
+    let partitions = nnz_balanced_partitions(ptr, parts);
+    #[cfg(test)]
+    CPU_PARTITION_TASKS.store(partitions.len(), Ordering::Relaxed);
+    partitions
+}
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Number of Rayon tasks the last parallel line walk spawned. Test-only probe
+/// for the hub-row imbalance regression: per-row `par_iter` would report
+/// `nrows` here; nnz-balanced partitions report about
+/// `workers * PARALLEL_PARTS_PER_WORKER`.
+#[cfg(test)]
+static CPU_PARTITION_TASKS: AtomicUsize = AtomicUsize::new(0);
+
 #[inline]
 fn row_dot(csr: &Csr, weights: &[f32], x: &[f32], r: usize) -> f32 {
-    let start = csr.row_ptr[r] as usize;
-    let end = csr.row_ptr[r + 1] as usize;
+    let start = csr.row_ptr()[r] as usize;
+    let end = csr.row_ptr()[r + 1] as usize;
     let mut sum = 0.0f32;
     for i in start..end {
-        sum += weights[i] * x[csr.col[i] as usize];
+        sum += weights[i] * x[csr.col()[i] as usize];
     }
     sum
 }
@@ -1608,8 +2120,14 @@ fn cpu_spmv_t_sequential(csc: &Csc, weights: &[f32], x: &[f32], y: &mut [f32]) {
 
 fn cpu_spmv_t_parallel(csc: &Csc, weights: &[f32], x: &[f32], y: &mut [f32]) {
     use rayon::prelude::*;
-    y.par_iter_mut().enumerate().for_each(|(c, y_val)| {
-        *y_val += col_dot(csc, weights, x, c);
+    let partitions = parallel_line_partitions(&csc.col_ptr, y.len());
+    let y_addr = y.as_mut_ptr() as usize;
+    partitions.into_par_iter().for_each(|(start, end)| {
+        for c in start..end {
+            // SAFETY: partitions claim disjoint column ranges of `y`.
+            let y_val = unsafe { &mut *(y_addr as *mut f32).add(c) };
+            *y_val += col_dot(csc, weights, x, c);
+        }
     });
 }
 
@@ -1640,8 +2158,8 @@ fn cpu_spmv_t_parallel(csc: &Csc, weights: &[f32], x: &[f32], y: &mut [f32]) {
 /// runs one short tile.
 #[inline]
 fn row_dot_batched(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, r: usize, out: &mut [f32]) {
-    let start = csr.row_ptr[r] as usize;
-    let end = csr.row_ptr[r + 1] as usize;
+    let start = csr.row_ptr()[r] as usize;
+    let end = csr.row_ptr()[r + 1] as usize;
     let mut v0 = 0usize;
     while v0 < n_vec {
         let width = BATCH_TILE.min(n_vec - v0);
@@ -1649,7 +2167,7 @@ fn row_dot_batched(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, r: usize
         // Zipped rather than indexed by `i`: same order, so the documented
         // bit-identity with `row_dot` holds, and the bounds checks on both
         // slices go away.
-        for (&w, &col) in weights[start..end].iter().zip(&csr.col[start..end]) {
+        for (&w, &col) in weights[start..end].iter().zip(&csr.col()[start..end]) {
             let base = col as usize * n_vec + v0;
             // The slices make the width known to the optimiser at the point of
             // use, so the tile stays in registers rather than being indexed.
@@ -1692,11 +2210,19 @@ fn cpu_spmm_parallel(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, y: &mu
         cpu_spmv_parallel(csr, weights, x, y);
         return;
     }
-    y.par_chunks_mut(n_vec)
-        .enumerate()
-        .for_each(|(r, row_out)| {
+    let nrows = y.len() / n_vec;
+    let partitions = parallel_line_partitions(csr.row_ptr(), nrows);
+    let y_addr = y.as_mut_ptr() as usize;
+    partitions.into_par_iter().for_each(|(start, end)| {
+        for r in start..end {
+            // SAFETY: partitions claim disjoint row ranges of `y`; the address
+            // is only used inside those ranges.
+            let row_out = unsafe {
+                std::slice::from_raw_parts_mut((y_addr as *mut f32).add(r * n_vec), n_vec)
+            };
             row_dot_batched(csr, weights, x, n_vec, r, row_out);
-        });
+        }
+    });
 }
 
 /// One row of `A · s` for a bitpacked spike vector.
@@ -1708,13 +2234,13 @@ fn cpu_spmm_parallel(csr: &Csr, weights: &[f32], x: &[f32], n_vec: usize, y: &mu
 /// `tolerance_for_spmv_spikes`.
 #[inline]
 fn row_dot_spikes(csr: &Csr, weights: &[f32], spikes: &[u32], r: usize) -> f32 {
-    let start = csr.row_ptr[r] as usize;
-    let end = csr.row_ptr[r + 1] as usize;
+    let start = csr.row_ptr()[r] as usize;
+    let end = csr.row_ptr()[r + 1] as usize;
     let mut sum = 0.0f32;
     // Zipped rather than index-walked, but still strictly in index order: the
     // bit-identity claim against the dense path is a claim about summation
     // order, so this may not be reassociated or reordered.
-    for (w, &col) in weights[start..end].iter().zip(&csr.col[start..end]) {
+    for (w, &col) in weights[start..end].iter().zip(&csr.col()[start..end]) {
         let c = col as usize;
         let bit = (spikes[c / 32] >> (c % 32)) & 1;
         sum += w * bit as f32;
@@ -1730,8 +2256,14 @@ fn cpu_spmv_spikes_sequential(csr: &Csr, weights: &[f32], spikes: &[u32], y: &mu
 
 fn cpu_spmv_spikes_parallel(csr: &Csr, weights: &[f32], spikes: &[u32], y: &mut [f32]) {
     use rayon::prelude::*;
-    y.par_iter_mut().enumerate().for_each(|(r, y_val)| {
-        *y_val += row_dot_spikes(csr, weights, spikes, r);
+    let partitions = parallel_line_partitions(csr.row_ptr(), y.len());
+    let y_addr = y.as_mut_ptr() as usize;
+    partitions.into_par_iter().for_each(|(start, end)| {
+        for r in start..end {
+            // SAFETY: partitions claim disjoint row ranges of `y`.
+            let y_val = unsafe { &mut *(y_addr as *mut f32).add(r) };
+            *y_val += row_dot_spikes(csr, weights, spikes, r);
+        }
     });
 }
 
@@ -1743,8 +2275,14 @@ fn cpu_spmv_sequential(csr: &Csr, weights: &[f32], x: &[f32], y: &mut [f32]) {
 
 fn cpu_spmv_parallel(csr: &Csr, weights: &[f32], x: &[f32], y: &mut [f32]) {
     use rayon::prelude::*;
-    y.par_iter_mut().enumerate().for_each(|(r, y_val)| {
-        *y_val += row_dot(csr, weights, x, r);
+    let partitions = parallel_line_partitions(csr.row_ptr(), y.len());
+    let y_addr = y.as_mut_ptr() as usize;
+    partitions.into_par_iter().for_each(|(start, end)| {
+        for r in start..end {
+            // SAFETY: partitions claim disjoint row ranges of `y`.
+            let y_val = unsafe { &mut *(y_addr as *mut f32).add(r) };
+            *y_val += row_dot(csr, weights, x, r);
+        }
     });
 }
 
@@ -1817,14 +2355,21 @@ fn cpu_fused_parallel(
     p: LifParams,
 ) {
     use rayon::prelude::*;
-    v.par_iter_mut()
-        .zip(theta.par_iter_mut())
-        .zip(spikes.par_iter_mut())
-        .enumerate()
-        .for_each(|(r, ((v_i, th_i), spk))| {
+    let partitions = parallel_line_partitions(csr.row_ptr(), v.len());
+    let v_addr = v.as_mut_ptr() as usize;
+    let th_addr = theta.as_mut_ptr() as usize;
+    let spk_addr = spikes.as_mut_ptr() as usize;
+    partitions.into_par_iter().for_each(|(start, end)| {
+        for r in start..end {
+            // SAFETY: partitions claim disjoint row indices across all three
+            // arrays; addresses are only used inside those ranges.
+            let v_i = unsafe { &mut *(v_addr as *mut f32).add(r) };
+            let th_i = unsafe { &mut *(th_addr as *mut f32).add(r) };
+            let spk = unsafe { &mut *(spk_addr as *mut bool).add(r) };
             let current = row_dot(csr, weights, x, r);
             lif_step(v_i, th_i, current, spk, p);
-        });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1925,5 +2470,113 @@ mod tolerance_tests {
             let t = tolerance_for_elementwise(mag);
             assert!(t > 0.0 && t.is_finite(), "mag={mag} gave {t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod nnz_balance_tests {
+    use super::*;
+
+    /// Hub + many leaves: per-row Rayon would spawn one task per row. The
+    /// nnz-balanced plan must put the leftover leaf work into the non-hub
+    /// parts instead of leaving them idle on a two-edge leaf each.
+    #[test]
+    fn hub_row_partitions_balance_leaf_work() {
+        let hub = 12_000u32;
+        let leaves = 3_000u32;
+        let mut row_ptr = vec![0u32, hub];
+        for i in 0..leaves {
+            row_ptr.push(hub + i + 1);
+        }
+        let workers = 8usize;
+        let parts = nnz_balanced_partitions(&row_ptr, workers);
+        assert_eq!(parts.len(), workers.min(row_ptr.len() - 1));
+        assert_eq!(parts.first().copied(), Some((0, 1)), "hub row is its own first part");
+        let leaf_nnz: Vec<usize> = parts[1..]
+            .iter()
+            .map(|&(s, e)| (row_ptr[e] - row_ptr[s]) as usize)
+            .collect();
+        let max_leaf = *leaf_nnz.iter().max().unwrap();
+        let min_leaf = *leaf_nnz.iter().min().unwrap();
+        assert!(
+            max_leaf - min_leaf <= 1,
+            "leaf parts must be nnz-balanced, got {leaf_nnz:?}"
+        );
+        assert_eq!(
+            leaf_nnz.iter().sum::<usize>(),
+            leaves as usize,
+            "every leaf edge must land in a non-hub part"
+        );
+    }
+
+    /// The parallel SpMV path must not fall back to one Rayon task per row on
+    /// a hub fixture: that is the idle-core failure the partitioner exists to
+    /// kill. Task count is recorded by `parallel_line_partitions`.
+    #[test]
+    fn parallel_spmv_spawns_partition_tasks_not_per_row() {
+        let nrows = 2_048usize;
+        let hub = 8_000usize;
+        let mut adj = vec![vec![0u32]; nrows];
+        adj[0] = (0..hub as u32).collect();
+        for (r, row) in adj.iter_mut().enumerate().skip(1) {
+            *row = vec![(r as u32) % (nrows as u32)];
+        }
+        let csr = Csr::from_adjacency(&adj);
+        let weights = vec![1.0f32; csr.nnz()];
+        let x = vec![1.0f32; csr.ncols()];
+        let mut y = vec![0.0f32; csr.nrows()];
+        CPU_PARTITION_TASKS.store(usize::MAX, Ordering::Relaxed);
+        cpu_spmv_parallel(&csr, &weights, &x, &mut y);
+        let tasks = CPU_PARTITION_TASKS.load(Ordering::Relaxed);
+        let workers = rayon::current_num_threads().max(1);
+        let max_parts = workers
+            .saturating_mul(PARALLEL_PARTS_PER_WORKER)
+            .min(nrows);
+        assert!(
+            tasks > 1 && tasks <= max_parts && tasks < nrows,
+            "expected nnz-balanced oversubscribe (<= {max_parts}), got {tasks} (nrows={nrows}, workers={workers})"
+        );
+    }
+
+    #[test]
+    fn nnz_balanced_spmv_matches_sequential_on_hub_fixture() {
+        let nrows = 512usize;
+        let mut adj = vec![vec![0u32]; nrows];
+        adj[0] = (0..4_000u32).collect();
+        for (r, row) in adj.iter_mut().enumerate().skip(1) {
+            *row = vec![0, 1, (r as u32) % 7];
+            row.sort();
+        }
+        let csr = Csr::from_adjacency(&adj);
+        let weights: Vec<f32> = (0..csr.nnz()).map(|i| (i % 11) as f32 * 0.1).collect();
+        let x: Vec<f32> = (0..csr.ncols()).map(|i| (i % 5) as f32).collect();
+        let mut y_seq = vec![0.25f32; csr.nrows()];
+        let mut y_par = y_seq.clone();
+        cpu_spmv_sequential(&csr, &weights, &x, &mut y_seq);
+        cpu_spmv_parallel(&csr, &weights, &x, &mut y_par);
+        assert_eq!(y_seq, y_par);
+    }
+
+    /// Uniform graphs still oversubscribe so heterogeneous cores can steal;
+    /// a 1:1 workers-parts plan is exactly the n=20k Rayon regression.
+    #[test]
+    fn parallel_spmv_oversubscribes_beyond_worker_count() {
+        let nrows = 2_048usize;
+        let csr = Csr::from_adjacency(
+            &(0..nrows)
+                .map(|r| vec![(r as u32) % (nrows as u32); 8])
+                .collect::<Vec<_>>(),
+        );
+        let weights = vec![1.0f32; csr.nnz()];
+        let x = vec![1.0f32; csr.ncols()];
+        let mut y = vec![0.0f32; csr.nrows()];
+        CPU_PARTITION_TASKS.store(0, Ordering::Relaxed);
+        cpu_spmv_parallel(&csr, &weights, &x, &mut y);
+        let tasks = CPU_PARTITION_TASKS.load(Ordering::Relaxed);
+        let workers = rayon::current_num_threads().max(1);
+        assert!(
+            tasks > workers,
+            "expected oversubscribe for stealability, got {tasks} tasks on {workers} workers"
+        );
     }
 }

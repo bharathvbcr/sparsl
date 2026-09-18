@@ -11,7 +11,7 @@ mod common;
 
 use common::{random_csr, random_vec};
 use sparsl::spikes::{pack_spikes, packed_len, spikes_to_f32};
-use sparsl::{available_backends, Backend, Device, Rng};
+use sparsl::{available_backends, Backend, Device, Rng, WeightPrecision};
 
 fn devices() -> Vec<Device> {
     available_backends()
@@ -58,7 +58,7 @@ fn a_cleared_spike_still_multiplies_its_weight() {
             // Put the non-finite weight on the first stored entry, and clear
             // exactly the column it multiplies.
             weights[0] = poison;
-            let poisoned_col = csr.col[0] as usize;
+            let poisoned_col = csr.col()[0] as usize;
             let spikes: Vec<bool> = (0..ncols).map(|c| c != poisoned_col).collect();
             let packed = pack_spikes(&spikes);
             let dense = spikes_to_f32(&packed, ncols);
@@ -122,6 +122,54 @@ fn the_spike_path_is_bit_identical_to_the_dense_one() {
                         via_packed[r],
                         via_dense[r]
                     );
+                }
+            }
+        }
+    }
+}
+
+/// Narrow residency quantises once; Metal SpMV streams the compact form while
+/// the spike path reads the widened f32 mirror. Both must still agree bit for
+/// bit with dense SpMV on the same operator — the public contract does not
+/// carve out F16/Bf16.
+#[test]
+fn narrow_weights_spike_path_is_bit_identical_to_dense() {
+    let mut rng = Rng::new(0xF16_5B17);
+    for precision in [WeightPrecision::F16, WeightPrecision::Bf16] {
+        for &(nrows, ncols, deg) in &[(64usize, 31usize, 6usize), (97, 64, 20), (48, 96, 40)] {
+            for &density in &[0.0f32, 0.15, 0.85, 1.0] {
+                let csr = random_csr(nrows, ncols, deg, &mut rng);
+                let weights = random_vec(csr.nnz(), 1.0, &mut rng);
+                let packed = pack_spikes(&random_spikes(ncols, density, &mut rng));
+                let dense = spikes_to_f32(&packed, ncols);
+
+                for device in devices() {
+                    let op = device
+                        .prepare_with(&csr, ncols, &weights, precision)
+                        .expect("prepare_with");
+                    // Metal streams the compact form for plain SpMV; CPU stores
+                    // only the widened f32 mirror and reports F32 here.
+                    if device.backend() == Backend::Metal {
+                        assert_eq!(op.weight_precision(), precision);
+                    }
+
+                    let mut via_dense = vec![0.0f32; nrows];
+                    op.spmv(&dense, &mut via_dense).expect("spmv");
+                    let mut via_packed = vec![0.0f32; nrows];
+                    op.spmv_spikes(&packed, &mut via_packed)
+                        .expect("spmv_spikes");
+
+                    for r in 0..nrows {
+                        assert_eq!(
+                            via_packed[r].to_bits(),
+                            via_dense[r].to_bits(),
+                            "{} {precision:?} (ncols={ncols}, density={density}): \
+                             row {r} packed {} against dense {}",
+                            op.label(),
+                            via_packed[r],
+                            via_dense[r]
+                        );
+                    }
                 }
             }
         }

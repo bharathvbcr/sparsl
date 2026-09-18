@@ -267,11 +267,11 @@ fn same_seed_yields_identical_state_fingerprint() {
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
         let csr = random_csr(64, 64, 8, &mut rng);
-        for &p in &csr.row_ptr {
+        for &p in csr.row_ptr() {
             hash ^= p as u64;
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
-        for &c in &csr.col {
+        for &c in csr.col() {
             hash ^= c as u64;
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }

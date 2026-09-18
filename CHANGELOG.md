@@ -6,6 +6,61 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-18
+
+Breaking CSR shape honesty: stored column count, sorted rows, and overflow-safe
+CSC conversion. The minor version moves because `Csr::from_parts` /
+`from_parts_unchecked` / `empty` gain a `ncols` argument, `row_ptr` / `col` are
+no longer public fields, and `CsrError` / `SparsePlanError` gain variants.
+
+### Added
+
+- **`Csr` stores `ncols`.** Trailing empty columns are no longer truncated by
+  an O(nnz) scan of stored indices. `from_parts(row_ptr, col, ncols)` validates
+  column range against that width; `from_adjacency` sets
+  `max(nrows, max_col + 1)` after stable-sorting each row; `empty(nrows, ncols)`
+  takes both dimensions. Accessors `row_ptr()` / `col()` replace public fields.
+- **`CsrError::RowUnsorted` / `SparsePlanError::RowUnsorted`.** Column indices
+  within a row must be non-decreasing (duplicates / multi-edges allowed).
+  `Device::prepare` re-checks order and refuses unsorted unchecked CSRs.
+- **`SparsePlanError::NcolsMismatch`.** `prepare` cross-checks
+  `csr.ncols() == ncols` so a wider stored operator cannot be prepared under a
+  narrower width.
+- **`CsrError::OffsetOverflow`.** `Csc::from_csr_rect` uses `checked_add` and
+  `u32::try_from` for degrees, column pointers, and edge ids instead of wrapping.
+- **Resident SpMV / fused LIF paths** so a BINN tick loop can upload state once
+  and step many times without rematerialising host x/y each tick.
+- **`MTLSharedEvent` wait / signal** on Metal operators for zero-copy handoff
+  with tessl.
+- **Release tooling:** `scripts/ci_local.sh`, `scripts/check_release_ready.sh`,
+  `.github/workflows/release.yml`, `.gitignore` for `.devmap/`, and package
+  `exclude` mirroring tessl so logo exploration cannot inflate the `.crate`.
+
+### Changed
+
+- **`Csc::from_csr` uses `csr.ncols()`** so trailing empty columns survive the
+  square transpose path.
+- **Rayon SpMV / fused paths oversubscribe 16× past the worker count** while
+  keeping nnz-balanced partitions. Wave-3's `parts = num_threads` blocked
+  work-stealing on 6P+12E and regressed n=20k by ~36%; the oversubscribe
+  recovers that without abandoning balance.
+
+### Performance (Apple M5 Pro, 2026-09-18)
+
+Sequential A/B vs clean `v0.2.1` HEAD. SpMV: two-pass median,
+`SPARSL_BENCH_WARMUP_ROUNDS=2` / `ROUNDS=6` / `ITERS=8`. SpMM: one pass,
+same sampling. Host load was elevated; treat ±~10% as noise.
+
+| workload | prev (ms) | 0.3.0 (ms) | Δ |
+|---|---:|---:|---:|
+| Metal SpMV n=20k / 20M nnz | 1.337 | 1.279 | **−4%** |
+| Rayon SpMV n=20k | 1.090 | 1.169 | +7% (was +36% mid-wave) |
+| Metal SpMM n=10k batch=8 | 0.450 | 0.412 | **−8%** |
+| Metal SpMM n=10k batch=32 | 1.277 | 1.355 | +6% |
+
+Quieter single-arm reconfirm after the Rayon fix measured **1.114 ms** at
+n=20k Rayon; the two-pass median above includes a contended second pass.
+
 ## [0.2.1] — 2026-09-14
 
 Documentation and brand assets only. No code, API or behaviour change; the
@@ -397,6 +452,7 @@ why each piece landed.
 - Canary sentinel buffers around every Metal allocation, and a golden output
   fingerprint pinned across releases.
 
+[0.3.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.3.0
 [0.2.1]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.2.1
 [0.2.0]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.2.0
 [0.1.1]: https://github.com/bharathvbcr/sparsl/releases/tag/v0.1.1

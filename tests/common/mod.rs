@@ -4,6 +4,10 @@
 use sparsl::{Backend, Csr, Device, LifParams, Rng, SparseShape};
 
 /// Deterministic random CSR with per-row degree in `0..=max_deg`.
+///
+/// Column indices are drawn from `0..ncols` and each row is sorted. The
+/// declared `ncols` is stored on the CSR (including trailing empty columns),
+/// which is what [`sparsl::Device::prepare`] cross-checks.
 pub fn random_csr(nrows: usize, ncols: usize, max_deg: usize, rng: &mut Rng) -> Csr {
     let mut adj: Vec<Vec<u32>> = Vec::with_capacity(nrows);
     for _ in 0..nrows {
@@ -20,7 +24,13 @@ pub fn random_csr(nrows: usize, ncols: usize, max_deg: usize, rng: &mut Rng) -> 
         }
         adj.push(row);
     }
-    Csr::from_adjacency(&adj)
+    let built = Csr::from_adjacency(&adj);
+    Csr::from_parts(
+        built.row_ptr().to_vec(),
+        built.col().to_vec(),
+        ncols,
+    )
+    .expect("random_csr adjacency must be valid for the declared ncols")
 }
 
 /// Uniform values in `[-scale, scale)`.
@@ -58,7 +68,7 @@ pub fn max_abs(values: &[f32]) -> f32 {
 /// matrix even though every input and output length is valid.
 pub fn max_col_nnz(csr: &Csr, ncols: usize) -> usize {
     let mut counts = vec![0usize; ncols];
-    for (edge, &col) in csr.col.iter().enumerate() {
+    for (edge, &col) in csr.col().iter().enumerate() {
         let count = counts.get_mut(col as usize).unwrap_or_else(|| {
             panic!("test fixture edge {edge} has column {col} outside ncols={ncols}")
         });

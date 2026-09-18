@@ -66,12 +66,15 @@ fn reference_fingerprint() -> u64 {
 
 /// Recorded on an Apple M5 Pro, aarch64-apple-darwin, `--release`.
 ///
+/// Updated for 0.3.0: `from_adjacency` / `random_csr` stable-sort each row, so
+/// edge order (and therefore left-to-right row sums) differ from 0.2.x.
+///
 /// This is a *value*, not a platform property: it depends only on IEEE-754 f32
 /// arithmetic performed in a fixed order, so it must hold on any target with
 /// standard floats. A mismatch on a different machine means either the
 /// arithmetic order changed or that target is doing something non-standard —
 /// both worth knowing before trusting a replay.
-const GOLDEN_REFERENCE_FINGERPRINT: u64 = 0xE7D4_DE54_FE3C_C803;
+const GOLDEN_REFERENCE_FINGERPRINT: u64 = 0x2D29_6707_56DF_C8D6;
 
 #[test]
 fn cpu_reference_output_is_pinned() {

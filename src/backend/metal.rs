@@ -12,9 +12,12 @@
 //! connectivity is worth ~23 dispatches. Copying `x` in and `y` out per call,
 //! by contrast, is free inside the noise: dispatch-only and copy-in/copy-out
 //! timings were within 1% of each other at every size measured. Unified memory
-//! means these are memcpys into shared storage, not bus transfers — so there is
-//! nothing to win from zero-copy tricks, and the simple, obviously-correct
-//! version is also the fast one.
+//! means these are memcpys into shared storage, not bus transfers — so the
+//! default path stays the simple copy. When a peer crate (tessl) already holds
+//! the dense vector as an `MTLBuffer`, [`MetalSparse::bind_mtl_x`] /
+//! [`MetalSparse::bind_mtl_y`] skip that memcpy. Cross-crate ordering uses
+//! `MTLSharedEvent` wait/signal — queues are **not** merged (Metal 3 here,
+//! Metal 4 in tessl).
 //!
 //! # Thread safety
 //!
@@ -33,7 +36,7 @@
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
@@ -42,8 +45,8 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLMathMode, MTLResourceOptions,
-    MTLSharedEvent, MTLSize,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLMathMode, MTLResource,
+    MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 
 // Aliases so the structs and signatures below read the same as they did under
@@ -115,6 +118,13 @@ impl Deref for RetainedCommandBuffer {
     }
 }
 
+// SAFETY: timed-out command buffers are retained only so [`reset_runtime`] can
+// poll `status()` under `TIMED_OUT_COMMANDS`'s mutex. Apple documents command
+// buffers as usable from any thread for status queries after commit; we never
+// encode into a buffer once it has been moved into that list.
+unsafe impl Send for RetainedCommandBuffer {}
+unsafe impl Sync for RetainedCommandBuffer {}
+
 use super::{LifParams, OpError, SparsePlanError, SparseShape};
 use crate::scan::State;
 use crate::sparse::{Csc, Csr};
@@ -138,6 +148,49 @@ const VEC_ROW_MIN_MEAN_NNZ: usize = 12;
 /// Mean stored non-zeros per line at or above which a line gets a whole
 /// 32-lane simdgroup instead of an eight-lane team.
 const SIMD_ROW_MIN_MEAN_NNZ: usize = 64;
+
+/// `max_row_nnz / mean` above this, with both long and short rows present,
+/// triggers the two-CSR hybrid: long rows on [`RowKernel::Simd`], short rows
+/// on the mean-chosen tier. Uniform graphs stay on a single tier.
+const HYBRID_SKEW_RATIO: usize = 16;
+
+/// Test-only host↔device copy probe for the resident step path.
+///
+/// Tracking is per-thread so parallel unit tests cannot inflate each other's
+/// counts. Enable around a resident dispatch; the hot path must leave the
+/// count at zero.
+#[cfg(test)]
+mod host_copy_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HOST_COPY_TRACKING: Cell<bool> = const { Cell::new(false) };
+        static HOST_COPY_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_host_copy() {
+        HOST_COPY_TRACKING.with(|on| {
+            if on.get() {
+                HOST_COPY_COUNT.with(|c| c.set(c.get() + 1));
+            }
+        });
+    }
+
+    pub(crate) fn begin_host_copy_probe() {
+        HOST_COPY_COUNT.with(|c| c.set(0));
+        HOST_COPY_TRACKING.with(|on| on.set(true));
+    }
+
+    pub(crate) fn end_host_copy_probe() -> usize {
+        HOST_COPY_TRACKING.with(|on| on.set(false));
+        HOST_COPY_COUNT.with(|c| c.replace(0))
+    }
+}
+
+#[cfg(test)]
+use host_copy_probe::note_host_copy;
+#[cfg(test)]
+pub(crate) use host_copy_probe::{begin_host_copy_probe, end_host_copy_probe};
 
 /// How many lanes a line gets in the line-parallel kernels.
 ///
@@ -281,16 +334,22 @@ const METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Returned after a non-terminal command exceeds [`METAL_COMMAND_TIMEOUT`].
 const METAL_QUARANTINED_REASON: &str =
-    "Metal is quarantined after a command buffer timed out; restart the process before submitting more work";
+    "Metal is quarantined after a command buffer timed out; call Device::reset_metal \
+     once the timed-out command is terminal, or restart the process before submitting more work";
+
+/// Why [`reset_runtime`] / [`crate::Device::reset_metal`] refused to clear
+/// quarantine or rebuild the submission path.
+pub use super::MetalResetError;
 
 /// Linearizes command admission against process-wide quarantine without ever
 /// blocking the timeout path on an opaque driver call.
 ///
-/// The high bit records permanent quarantine; the remaining bits count
+/// The high bit records quarantine; the remaining bits count
 /// submissions admitted before it was published. A successful increment is a
 /// command's admission linearization point. Once the high bit is set every
 /// later increment is refused, while already-issued permits remain valid until
-/// their `commit()` call returns.
+/// their `commit()` call returns. [`reset_runtime`] clears the high bit only
+/// when admissions are zero and every retained timed-out command is terminal.
 ///
 /// That distinction is load-bearing. Metal exposes no cancellation primitive,
 /// so an already-entered `commit()` may itself stall. Waiting for every permit
@@ -334,7 +393,11 @@ impl MetalAdmission {
         self.state.fetch_or(METAL_QUARANTINED_BIT, Ordering::AcqRel);
     }
 
-    #[cfg(test)]
+    fn clear_quarantine(&self) {
+        self.state
+            .fetch_and(!METAL_QUARANTINED_BIT, Ordering::AcqRel);
+    }
+
     fn active_admissions(&self) -> usize {
         self.state.load(Ordering::Acquire) & METAL_ACTIVE_ADMISSIONS_MASK
     }
@@ -359,30 +422,49 @@ impl Drop for SubmissionPermit<'_> {
 
 static METAL_ADMISSION: MetalAdmission = MetalAdmission::new();
 
-/// Process-wide Metal device initialisation, attempted at most once.
+/// Timed-out command buffers retained until they become terminal (or process
+/// exit). [`reset_runtime`] inspects these before clearing quarantine.
+static TIMED_OUT_COMMANDS: Mutex<Vec<RetainedCommandBuffer>> = Mutex::new(Vec::new());
+
+/// Process-wide Metal device initialisation.
 ///
 /// Compiling the MSL library and building eleven pipeline states costs real
-/// milliseconds, and nothing about it varies per caller. This records initial
-/// availability; [`METAL_ADMISSION`] layers dynamic timeout quarantine over it.
-fn shared() -> &'static Result<Arc<MetalDevice>, &'static str> {
-    static SHARED: OnceLock<Result<Arc<MetalDevice>, &'static str>> = OnceLock::new();
-    SHARED.get_or_init(|| MetalDevice::open_uncached().map(Arc::new))
+/// milliseconds, and nothing about it varies per caller. Held in a mutex so
+/// [`reset_runtime`] can rebuild the submission path after a fail-closed
+/// quarantine clears. [`METAL_ADMISSION`] layers dynamic timeout quarantine
+/// over availability.
+fn shared_slot() -> std::sync::MutexGuard<'static, Option<Result<Arc<MetalDevice>, &'static str>>> {
+    SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+static SHARED: Mutex<Option<Result<Arc<MetalDevice>, &'static str>>> = Mutex::new(None);
+
+fn shared() -> Result<Arc<MetalDevice>, &'static str> {
+    let mut slot = shared_slot();
+    if let Some(result) = slot.as_ref() {
+        return result.clone();
+    }
+    let result = MetalDevice::open_uncached().map(Arc::new);
+    *slot = Some(result.clone());
+    result
 }
 
 /// The shared device, or why it could not be opened.
 pub fn shared_device() -> Result<Arc<MetalDevice>, &'static str> {
     ensure_admission_healthy(&METAL_ADMISSION)?;
-    let device = shared().clone();
+    let device = shared()?;
     // `shared()` may perform cold shader compilation. A timeout can quarantine
     // Metal while that happens, so do not hand a newly initialised device to a
     // caller after quarantine was published.
     ensure_admission_healthy(&METAL_ADMISSION)?;
-    device
+    Ok(device)
 }
 
 /// `None` when Metal can execute here.
 pub fn unavailable_reason() -> Option<&'static str> {
-    quarantine_reason(&METAL_ADMISSION).or_else(|| shared().as_ref().err().copied())
+    quarantine_reason(&METAL_ADMISSION).or_else(|| shared().err())
 }
 
 fn quarantine_reason(admission: &MetalAdmission) -> Option<&'static str> {
@@ -417,10 +499,60 @@ fn admit_submission<R>(
     Ok(result)
 }
 
+/// Clear Metal quarantine and rebuild the process-wide submission path.
+///
+/// Succeeds only when no admission permits are outstanding and every command
+/// buffer retained by a prior non-terminal timeout has reached a terminal
+/// Metal status. On success the quarantine bit is cleared, timed-out command
+/// buffers are dropped, and the shared device's command queue plus completion
+/// event are replaced. If a timed-out command is still non-terminal, quarantine
+/// stays published and this returns [`MetalResetError::NonTerminalCommand`].
+pub fn reset_runtime() -> Result<(), MetalResetError> {
+    let active = METAL_ADMISSION.active_admissions();
+    if active != 0 {
+        return Err(MetalResetError::ActiveAdmissions { count: active });
+    }
+
+    {
+        let timed_out = TIMED_OUT_COMMANDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for cb in timed_out.iter() {
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed
+                && status != MTLCommandBufferStatus::Error
+            {
+                // Keep quarantine published: a non-terminal command still owns
+                // resources that a rebuilt queue must not pretend are free.
+                return Err(MetalResetError::NonTerminalCommand);
+            }
+        }
+    }
+
+    // Rebuild while quarantine (if any) is still published so new admissions
+    // cannot race a half-replaced queue. Clear only after the path is live.
+    {
+        let slot = shared_slot();
+        if let Some(Ok(device)) = slot.as_ref() {
+            device
+                .recreate_submission_path()
+                .map_err(MetalResetError::Backend)?;
+        }
+    }
+
+    TIMED_OUT_COMMANDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    METAL_ADMISSION.clear_quarantine();
+    Ok(())
+}
+
 /// Turn a one-off dynamic error into a `&'static str`.
 ///
-/// Called at most once per process, from inside the `OnceLock` initialiser, so
-/// the leak is bounded by the number of distinct failure paths (one).
+/// Called from the shared-device initialiser, so the leak is bounded by the
+/// number of distinct failure paths (one per process lifetime, plus resets
+/// that re-open after a prior open failure).
 fn leak(reason: String) -> &'static str {
     Box::leak(reason.into_boxed_str())
 }
@@ -442,7 +574,8 @@ struct LinePipelines {
 
 pub struct MetalDevice {
     device: MtlDevice,
-    queue: CommandQueue,
+    /// Submission queue. Replaced by [`reset_runtime`] after quarantine clears.
+    queue: Mutex<CommandQueue>,
     /// The line-parallel pipelines, one set per [`RowKernel`] tier, indexed
     /// by the tier's discriminant.
     tiers: [LinePipelines; 3],
@@ -470,7 +603,8 @@ pub struct MetalDevice {
     /// operator scratch, `assoc_scan` and dense `lif_integrate`. Held across
     /// submit-and-wait, so those two serialise with each other; a scan already
     /// serialises on `scan_scratch`, and the dense LIF path is documented as a
-    /// correctness path rather than a throughput one.
+    /// correctness path rather than a throughput one. Replaced together with
+    /// [`Self::queue`] on a successful [`reset_runtime`].
     completion: Mutex<Completion>,
 }
 
@@ -487,17 +621,17 @@ struct ScanScratch {
 
 // SAFETY: every field is a Metal object Apple documents as safe to use from
 // multiple threads — `MTLDevice`, `MTLCommandQueue` and `MTLComputePipelineState`
-// are all thread-safe, and the pipelines and queue are built once in
-// `open_uncached` and never mutated afterwards. The struct is reached only
-// through an `Arc` handed out by `shared()`.
+// are all thread-safe, and the pipelines are built once in `open_uncached` and
+// never mutated afterwards. The struct is reached only through an `Arc` handed
+// out by `shared()`.
 //
-// `scan_scratch` and `completion` are the mutable fields, and they are mutable
-// only behind a `Mutex`: every access takes the lock, so the buffers and the
-// timeline counter inside are reached by one thread at a time and no dispatch
-// reads them outside the guard that submitted it. That is the same discipline
-// the per-operator `Scratch` already relies on. `MTLSharedEvent` itself is
-// documented by Apple as safe to signal and wait on from any thread — it
-// exists for cross-queue and cross-process synchronisation.
+// `queue`, `scan_scratch` and `completion` are the mutable fields, and they are
+// mutable only behind a `Mutex`: every access takes the lock, so the queue,
+// buffers and the timeline counter inside are reached by one thread at a time
+// and no dispatch reads them outside the guard that submitted it. That is the
+// same discipline the per-operator `Scratch` already relies on. `MTLSharedEvent`
+// itself is documented by Apple as safe to signal and wait on from any thread —
+// it exists for cross-queue and cross-process synchronisation.
 //
 // This is the narrow form of what metal-rs asserted for its whole type set.
 unsafe impl Send for MetalDevice {}
@@ -639,7 +773,7 @@ impl MetalDevice {
 
         Ok(Self {
             device,
-            queue,
+            queue: Mutex::new(queue),
             tiers,
             scan_chunk,
             scan_offsets,
@@ -648,6 +782,39 @@ impl MetalDevice {
             scan_scratch: Mutex::new(None),
             completion,
         })
+    }
+
+    /// Replace the command queue and device-level completion timeline.
+    ///
+    /// Called only from [`reset_runtime`] after timed-out buffers are known
+    /// terminal and no admission permits are outstanding.
+    fn recreate_submission_path(&self) -> Result<(), &'static str> {
+        let new_queue = self
+            .device
+            .newCommandQueue()
+            .ok_or("Metal device returned no command queue during reset")?;
+        let new_completion = Completion::new(&self.device)
+            .ok_or("Metal device returned no shared event during reset")?;
+        *self
+            .queue
+            .lock()
+            .map_err(|_| "sparsl Metal command queue mutex is poisoned")? = new_queue;
+        *self
+            .completion
+            .lock()
+            .map_err(|_| "sparsl completion mutex is poisoned")? = new_completion;
+        Ok(())
+    }
+
+    /// Allocate a command buffer on the current submission queue.
+    fn command_buffer(
+        &self,
+        missing_reason: &'static str,
+    ) -> Result<RetainedCommandBuffer, OpError> {
+        let queue = self.queue.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl Metal command queue mutex is poisoned",
+        })?;
+        command_buffer(&queue, missing_reason)
     }
 
     /// A fresh completion timeline for one serialised submission stream.
@@ -796,8 +963,8 @@ impl MetalDevice {
         precision: super::WeightPrecision,
     ) -> Result<MetalSparse, SparsePlanError> {
         ensure_device_healthy_for_plan()?;
-        let row_ptr = self.upload(&csr.row_ptr, "row_ptr")?;
-        let col = self.upload(&csr.col, "col")?;
+        let row_ptr = self.upload(csr.row_ptr(), "row_ptr")?;
+        let col = self.upload(csr.col(), "col")?;
         // Uploaded as raw `u16`; the selected compact SpMV kernel declares the
         // same memory as `half` or `bfloat`. The host encoders are cross-checked
         // against Metal's own widening in `tests/narrow_backend.rs`, so "same
@@ -815,10 +982,17 @@ impl MetalDevice {
             }),
             None => None,
         };
+        let hybrid = build_hybrid_forward(self, csr, shape, weights, precision)?;
+        let hybrid_t = match csc {
+            Some(c) => build_hybrid_transpose(self, c, shape)?,
+            None => None,
+        };
         let scratch = Scratch {
             x: self.alloc::<f32>(shape.ncols, "x")?,
+            x_external: None,
             x_spikes: self.alloc::<u32>(crate::spikes::packed_len(shape.ncols), "x_spikes")?,
             y: self.alloc_guarded::<f32>(shape.nrows, "y")?,
+            y_external: None,
             // Allocated only alongside the reverse index, so a forward-only
             // operator pays neither the index nor the scratch.
             yt: match csc {
@@ -846,6 +1020,8 @@ impl MetalDevice {
             values_narrow,
             precision,
             transpose,
+            hybrid,
+            hybrid_t,
             shape,
             row_kernel: RowKernel::for_shape(shape.nrows(), shape.nnz()),
             col_kernel: RowKernel::for_shape(shape.ncols(), shape.nnz()),
@@ -938,7 +1114,7 @@ impl MetalDevice {
         totals.arm_at(totals_bytes);
         write_from(xs_buf, xs);
 
-        let cb = command_buffer(&self.queue, "scan: Metal returned no command buffer")?;
+        let cb = self.command_buffer("scan: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "scan: Metal returned no compute encoder",
         })?;
@@ -1030,7 +1206,7 @@ impl MetalDevice {
             })?;
 
         let tg = self.threadgroup_for(&self.lif);
-        let cb = command_buffer(&self.queue, "LIF: Metal returned no command buffer")?;
+        let cb = self.command_buffer("LIF: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "LIF: Metal returned no compute encoder",
         })?;
@@ -1159,10 +1335,16 @@ impl Guarded {
 /// writes carries one.
 struct Scratch {
     x: Buffer,
+    /// When set, kernels bind this instead of [`Self::x`] and host uploads of
+    /// `x` are skipped (caller-owned `MTLBuffer` handoff).
+    x_external: Option<Buffer>,
     /// Packed spike vector, `packed_len(ncols)` words. Allocated with the rest
     /// so the spike path costs no per-call allocation either.
     x_spikes: Buffer,
     y: Guarded,
+    /// When set, kernels bind this instead of [`Self::y`]'s usable region and
+    /// host y round-trips are skipped. External `y` has no canary tail.
+    y_external: Option<Buffer>,
     /// Transposed output, `ncols` long. Separate from `y` because the two
     /// directions have different lengths and a shared buffer sized for the
     /// larger would let a length bug read the other's stale tail.
@@ -1187,6 +1369,16 @@ struct Scratch {
     completion: Completion,
 }
 
+impl Scratch {
+    fn x_buf(&self) -> &Buffer {
+        self.x_external.as_ref().unwrap_or(&self.x)
+    }
+
+    fn y_buf(&self) -> &Buffer {
+        self.y_external.as_ref().unwrap_or(&self.y.buffer)
+    }
+}
+
 /// A CSR operator resident on the GPU.
 pub struct MetalSparse {
     device: Arc<MetalDevice>,
@@ -1209,9 +1401,15 @@ pub struct MetalSparse {
     /// Reverse index, present only when the operator was prepared for it.
     /// `edge_idx` points into `values`, so both directions read one table.
     transpose: Option<TransposeIndex>,
+    /// Degree-skew split of the forward CSR. `None` on uniform graphs.
+    hybrid: Option<HybridForward>,
+    /// Degree-skew split of the CSC. `None` when transpose was not prepared
+    /// or columns are uniform.
+    hybrid_t: Option<HybridTranspose>,
     shape: SparseShape,
     /// Row-parallel shape for the forward kernels, fixed at prepare time so
     /// plain SpMV and the spike path always traverse a row identically.
+    /// Ignored for forward work when [`Self::hybrid`] is set.
     row_kernel: RowKernel,
     /// The same decision for the transposed direction, taken over columns
     /// because that is what `csc_spmv_t` assigns a simdgroup to.
@@ -1235,6 +1433,202 @@ struct TransposeIndex {
     edge_idx: Buffer,
 }
 
+/// One side of a degree-skew hybrid: packed CSR (empty rows for the other
+/// class) with its own col/values and a fixed tier.
+struct HybridSide {
+    row_ptr: Buffer,
+    col: Buffer,
+    values: Buffer,
+    values_narrow: Option<Buffer>,
+    kernel: RowKernel,
+    /// Host-side ranges into the original weight table, one per non-empty
+    /// packed row segment, used by [`MetalSparse::set_weights`].
+    src_edges: Vec<(usize, usize)>,
+}
+
+/// Two-CSR forward plan: long rows on Simd, short on the mean-chosen tier.
+struct HybridForward {
+    long: HybridSide,
+    short: HybridSide,
+}
+
+/// Column-side hybrid for the transposed product.
+struct HybridTranspose {
+    long: TransposeIndex,
+    short: TransposeIndex,
+    long_kernel: RowKernel,
+    short_kernel: RowKernel,
+}
+
+/// Packed CSR for one hybrid class: rows that fail `keep` are empty.
+type PackedHybridSide = (Vec<u32>, Vec<u32>, Vec<f32>, Vec<(usize, usize)>);
+
+fn pack_hybrid_side(
+    csr: &Csr,
+    weights: &[f32],
+    keep: impl Fn(usize, usize) -> bool,
+) -> PackedHybridSide {
+    let nrows = csr.nrows();
+    let rp = csr.row_ptr();
+    let mut row_ptr = Vec::with_capacity(nrows + 1);
+    let mut col = Vec::new();
+    let mut vals = Vec::new();
+    let mut src_edges = Vec::new();
+    row_ptr.push(0);
+    for r in 0..nrows {
+        let s = rp[r] as usize;
+        let e = rp[r + 1] as usize;
+        let nnz = e - s;
+        if keep(r, nnz) {
+            col.extend_from_slice(&csr.col()[s..e]);
+            vals.extend_from_slice(&weights[s..e]);
+            src_edges.push((s, e));
+        }
+        row_ptr.push(col.len() as u32);
+    }
+    (row_ptr, col, vals, src_edges)
+}
+
+fn skew_triggers_hybrid(lines: usize, nnz: usize, max_nnz: usize) -> bool {
+    if lines == 0 || nnz == 0 || max_nnz == 0 {
+        return false;
+    }
+    let mean = nnz / lines;
+    mean > 0 && max_nnz / mean > HYBRID_SKEW_RATIO
+}
+
+fn build_hybrid_forward(
+    device: &MetalDevice,
+    csr: &Csr,
+    shape: SparseShape,
+    weights: &[f32],
+    precision: super::WeightPrecision,
+) -> Result<Option<HybridForward>, SparsePlanError> {
+    if !skew_triggers_hybrid(shape.nrows(), shape.nnz(), shape.max_row_nnz()) {
+        return Ok(None);
+    }
+    let rp = csr.row_ptr();
+    let mut n_long = 0usize;
+    let mut n_short = 0usize;
+    let mut short_nnz = 0usize;
+    for r in 0..shape.nrows() {
+        let d = (rp[r + 1] - rp[r]) as usize;
+        if d >= SIMD_ROW_MIN_MEAN_NNZ {
+            n_long += 1;
+        } else {
+            n_short += 1;
+            short_nnz += d;
+        }
+    }
+    if n_long == 0 || n_short == 0 {
+        return Ok(None);
+    }
+    let short_kernel = RowKernel::for_shape(n_short, short_nnz);
+    let upload_side = |keep: fn(usize, usize) -> bool,
+                       kernel: RowKernel,
+                       tag: &'static str|
+     -> Result<HybridSide, SparsePlanError> {
+        let (row_ptr, col, vals, src_edges) = pack_hybrid_side(csr, weights, keep);
+        let values_narrow = match precision.narrow_bits(&vals) {
+            Some(bits) => Some(device.upload(&bits, tag)?),
+            None => None,
+        };
+        Ok(HybridSide {
+            row_ptr: device.upload(&row_ptr, tag)?,
+            col: device.upload(&col, tag)?,
+            values: device.upload(&vals, tag)?,
+            values_narrow,
+            kernel,
+            src_edges,
+        })
+    };
+    let long = upload_side(
+        |_, nnz| nnz >= SIMD_ROW_MIN_MEAN_NNZ,
+        RowKernel::Simd,
+        "hybrid_long",
+    )?;
+    let short = upload_side(
+        |_, nnz| nnz < SIMD_ROW_MIN_MEAN_NNZ,
+        short_kernel,
+        "hybrid_short",
+    )?;
+    Ok(Some(HybridForward { long, short }))
+}
+
+fn max_col_nnz(csc: &Csc) -> usize {
+    let ncols = csc.col_ptr.len().saturating_sub(1);
+    (0..ncols)
+        .map(|c| (csc.col_ptr[c + 1] - csc.col_ptr[c]) as usize)
+        .max()
+        .unwrap_or(0)
+}
+
+fn pack_hybrid_csc(
+    csc: &Csc,
+    keep: impl Fn(usize, usize) -> bool,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let ncols = csc.col_ptr.len().saturating_sub(1);
+    let mut col_ptr = Vec::with_capacity(ncols + 1);
+    let mut row = Vec::new();
+    let mut edge_idx = Vec::new();
+    col_ptr.push(0);
+    for c in 0..ncols {
+        let s = csc.col_ptr[c] as usize;
+        let e = csc.col_ptr[c + 1] as usize;
+        let nnz = e - s;
+        if keep(c, nnz) {
+            row.extend_from_slice(&csc.row[s..e]);
+            edge_idx.extend_from_slice(&csc.edge_idx[s..e]);
+        }
+        col_ptr.push(row.len() as u32);
+    }
+    (col_ptr, row, edge_idx)
+}
+
+fn build_hybrid_transpose(
+    device: &MetalDevice,
+    csc: &Csc,
+    shape: SparseShape,
+) -> Result<Option<HybridTranspose>, SparsePlanError> {
+    let max_c = max_col_nnz(csc);
+    if !skew_triggers_hybrid(shape.ncols(), shape.nnz(), max_c) {
+        return Ok(None);
+    }
+    let ncols = shape.ncols();
+    let mut n_long = 0usize;
+    let mut n_short = 0usize;
+    let mut short_nnz = 0usize;
+    for c in 0..ncols {
+        let d = (csc.col_ptr[c + 1] - csc.col_ptr[c]) as usize;
+        if d >= SIMD_ROW_MIN_MEAN_NNZ {
+            n_long += 1;
+        } else {
+            n_short += 1;
+            short_nnz += d;
+        }
+    }
+    if n_long == 0 || n_short == 0 {
+        return Ok(None);
+    }
+    let short_kernel = RowKernel::for_shape(n_short, short_nnz);
+    let upload = |keep: fn(usize, usize) -> bool,
+                  tag: &'static str|
+     -> Result<TransposeIndex, SparsePlanError> {
+        let (col_ptr, row, edge_idx) = pack_hybrid_csc(csc, keep);
+        Ok(TransposeIndex {
+            col_ptr: device.upload(&col_ptr, tag)?,
+            row: device.upload(&row, tag)?,
+            edge_idx: device.upload(&edge_idx, tag)?,
+        })
+    };
+    Ok(Some(HybridTranspose {
+        long: upload(|_, nnz| nnz >= SIMD_ROW_MIN_MEAN_NNZ, "hybrid_t_long")?,
+        short: upload(|_, nnz| nnz < SIMD_ROW_MIN_MEAN_NNZ, "hybrid_t_short")?,
+        long_kernel: RowKernel::Simd,
+        short_kernel,
+    }))
+}
+
 impl MetalSparse {
     /// Overwrite the resident values. Length is checked by the caller.
     pub fn set_weights(&mut self, weights: &[f32]) -> Result<(), OpError> {
@@ -1250,6 +1644,265 @@ impl MetalSparse {
         ) {
             write_from(buffer, &bits);
         }
+        if let Some(hybrid) = self.hybrid.as_ref() {
+            refresh_hybrid_side(&hybrid.long, weights, self.precision)?;
+            refresh_hybrid_side(&hybrid.short, weights, self.precision)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this operator split its forward CSR on degree skew.
+    #[cfg(test)]
+    pub(crate) fn is_hybrid_forward(&self) -> bool {
+        self.hybrid.is_some()
+    }
+
+    fn validate_external_vec(
+        &self,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+        elems: usize,
+        what: &'static str,
+    ) -> Result<(), OpError> {
+        if buffer.device().registryID() != self.device.device.registryID() {
+            return Err(OpError::Backend {
+                reason: "external MTLBuffer device registryID does not match sparsl Metal device",
+            });
+        }
+        let need = elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(OpError::SizeOverflow {
+                what: "external MTLBuffer byte length",
+                lhs: elems,
+                rhs: std::mem::size_of::<f32>(),
+            })?;
+        let got = buffer.length() as usize;
+        if got < need {
+            return Err(OpError::TooShort {
+                what,
+                min: need,
+                got,
+            });
+        }
+        Ok(())
+    }
+
+    /// Bind a caller-owned `MTLBuffer` as the SpMV `x` operand (no host copy).
+    ///
+    /// Length must be at least `ncols` f32 elements and the buffer's device
+    /// `registryID` must match this operator. CSR/weights stay on the prepared
+    /// resident path. Pair with [`Self::unbind_mtl_x`] to restore owned scratch.
+    pub fn bind_mtl_x(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) -> Result<(), OpError> {
+        self.validate_external_vec(&buffer, self.shape.ncols, "external x")?;
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        guard.x_external = Some(buffer);
+        Ok(())
+    }
+
+    /// Bind a caller-owned `MTLBuffer` as the SpMV `y` operand (no host copy).
+    pub fn bind_mtl_y(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) -> Result<(), OpError> {
+        self.validate_external_vec(&buffer, self.shape.nrows, "external y")?;
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        guard.y_external = Some(buffer);
+        Ok(())
+    }
+
+    /// Drop the external `x` binding and return to owned scratch.
+    pub fn unbind_mtl_x(&self) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        guard.x_external = None;
+        Ok(())
+    }
+
+    /// Drop the external `y` binding and return to owned scratch.
+    pub fn unbind_mtl_y(&self) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        guard.y_external = None;
+        Ok(())
+    }
+
+    /// GPU address of the currently bound `x` buffer (external or owned).
+    pub fn mtl_x_gpu_address(&self) -> Result<u64, OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        Ok(guard.x_buf().gpuAddress())
+    }
+
+    /// GPU address of the currently bound `y` buffer (external or owned).
+    pub fn mtl_y_gpu_address(&self) -> Result<u64, OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        Ok(guard.y_buf().gpuAddress())
+    }
+
+    /// Allocate a shared-storage f32 `MTLBuffer` on this operator's device.
+    ///
+    /// Useful for filling an operand that will be bound via [`Self::bind_mtl_x`]
+    /// / [`Self::bind_mtl_y`] without a tessl dependency.
+    pub fn alloc_mtl_f32(&self, data: &[f32]) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, OpError> {
+        ensure_device_healthy()?;
+        let buf = self
+            .device
+            .upload(data, "external operand")
+            .map_err(|_| OpError::Backend {
+                reason: "could not allocate external MTLBuffer on sparsl Metal device",
+            })?;
+        Ok(buf)
+    }
+
+    /// Host-wait until `event` has signaled at least `value`.
+    ///
+    /// Cross-crate handoff with tessl (different queues; no queue merge): after
+    /// tessl commits, wait on `(tessl.shared_event(), tessl.last_signaled_value())`
+    /// before reading a shared `MTLBuffer` as SpMV `x`/`y`.
+    pub fn wait_shared_event(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+        timeout_ms: u64,
+    ) -> Result<(), OpError> {
+        ensure_device_healthy()?;
+        if value == 0 {
+            return Ok(());
+        }
+        if !event.waitUntilSignaledValue_timeoutMS(value, timeout_ms) {
+            return Err(OpError::Execution {
+                operation: "wait_shared_event",
+                detail: format!("SharedEvent wait timed out for value {value}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Host-signal `event` to `value` after this operator's GPU work is done.
+    ///
+    /// Prefer calling this only after a successful SpMV/LIF that waited on a
+    /// peer timeline, so tessl can `waitUntilSignaledValue` before reuse.
+    pub fn signal_shared_event(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), OpError> {
+        ensure_device_healthy()?;
+        event.setSignaledValue(value);
+        Ok(())
+    }
+
+    /// Upload `x` into resident scratch without dispatching.
+    pub fn write_x(&self, x: &[f32]) -> Result<(), OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        if guard.x_external.is_some() {
+            return Err(OpError::Backend {
+                reason: "write_x refused while an external MTLBuffer is bound as x; unbind first",
+            });
+        }
+        write_from(&guard.x, &x[..self.shape.ncols]);
+        Ok(())
+    }
+
+    /// Upload `y` into resident scratch without dispatching.
+    pub fn write_y(&self, y: &[f32]) -> Result<(), OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        if guard.y_external.is_some() {
+            return Err(OpError::Backend {
+                reason: "write_y refused while an external MTLBuffer is bound as y; unbind first",
+            });
+        }
+        guard.y.write(&y[..self.shape.nrows]);
+        Ok(())
+    }
+
+    /// Upload LIF state into resident scratch without dispatching.
+    pub fn write_lif_state(&self, v: &[f32], theta: &[f32]) -> Result<(), OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        guard.v.write(&v[..self.shape.nrows]);
+        guard.theta.write(&theta[..self.shape.nrows]);
+        Ok(())
+    }
+
+    /// `y += A · x` on resident scratch; no host readback.
+    pub fn spmv_resident(&self) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        let scratch = &mut *guard;
+        ensure_device_healthy()?;
+        self.dispatch_spmv(scratch, false)?;
+        Ok(())
+    }
+
+    /// Fused SpMV+LIF on resident scratch; no host readback.
+    pub fn fused_spmv_lif_resident(&self, params: LifParams) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        let scratch = &mut *guard;
+        ensure_device_healthy()?;
+        self.dispatch_fused(scratch, params, false)?;
+        Ok(())
+    }
+
+    /// Canary check + read `y` back to the host.
+    pub fn sync_y(&self, y: &mut [f32]) -> Result<(), OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        if guard.y_external.is_none() {
+            guard.y.assert_intact();
+        }
+        read_into(guard.y_buf(), &mut y[..self.shape.nrows]);
+        Ok(())
+    }
+
+    /// Canary check + read LIF state back to the host.
+    pub fn sync_lif_state(
+        &self,
+        v: &mut [f32],
+        theta: &mut [f32],
+        spikes: &mut [bool],
+    ) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        guard.v.assert_intact();
+        guard.theta.assert_intact();
+        guard.spikes.assert_intact();
+        read_into(&guard.v.buffer, &mut v[..self.shape.nrows]);
+        read_into(&guard.theta.buffer, &mut theta[..self.shape.nrows]);
+        let Scratch {
+            spikes: spikes_buf,
+            spikes_host,
+            ..
+        } = &mut *guard;
+        read_buffer_into(&spikes_buf.buffer, spikes_host);
+        for (dst, &src) in spikes[..self.shape.nrows]
+            .iter_mut()
+            .zip(spikes_host.iter())
+        {
+            *dst = src != 0;
+        }
         Ok(())
     }
 
@@ -1263,29 +1916,128 @@ impl MetalSparse {
         // this mutex. Recheck after acquiring it so stalled GPU work never
         // releases scratch into a waiter that would immediately reuse it.
         ensure_device_healthy()?;
-        write_from(&scratch.x, &x[..self.shape.ncols]);
-        scratch.y.write(y);
+        if scratch.x_external.is_none() {
+            write_from(&scratch.x, &x[..self.shape.ncols]);
+        }
+        if scratch.y_external.is_none() {
+            scratch.y.write(y);
+        }
+        self.dispatch_spmv(scratch, true)?;
+        if scratch.y_external.is_none() {
+            read_into(&scratch.y.buffer, y);
+        } else {
+            read_into(scratch.y_buf(), y);
+        }
+        drop(guard);
+        Ok(())
+    }
 
-        // One f32 and two narrow pipelines. The compact one is selected by the
-        // operator's resident quantisation, not by a caller-supplied flag that
-        // could disagree with what was uploaded.
-        let tier = self.device.tier(self.row_kernel);
-        let (pipeline, values) = match (self.precision, self.values_narrow.as_ref()) {
-            (super::WeightPrecision::F16, Some(narrow)) => (&tier.spmv_f16, narrow),
-            (super::WeightPrecision::Bf16, Some(narrow)) => (&tier.spmv_bf16, narrow),
-            _ => (&tier.spmv, &self.values),
-        };
-        let cb = command_buffer(&self.device.queue, "SpMV: Metal returned no command buffer")?;
+    fn dispatch_spmv(&self, scratch: &mut Scratch, check_canary: bool) -> Result<(), OpError> {
+        let cb = self
+            .device
+            .command_buffer("SpMV: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "SpMV: Metal returned no compute encoder",
+        })?;
+        let x = scratch.x_buf();
+        let y = scratch.y_buf();
+        match self.hybrid.as_ref() {
+            Some(hybrid) => {
+                encode_hybrid_spmv(self, &enc, hybrid, x, y)?;
+            }
+            None => {
+                let tier = self.device.tier(self.row_kernel);
+                let (pipeline, values) = match (self.precision, self.values_narrow.as_ref()) {
+                    (super::WeightPrecision::F16, Some(narrow)) => (&tier.spmv_f16, narrow),
+                    (super::WeightPrecision::Bf16, Some(narrow)) => (&tier.spmv_bf16, narrow),
+                    _ => (&tier.spmv, &self.values),
+                };
+                enc.setComputePipelineState(pipeline);
+                set_buf(&enc, 0, &self.row_ptr);
+                set_buf(&enc, 1, &self.col);
+                set_buf(&enc, 2, values);
+                set_buf(&enc, 3, x);
+                set_buf(&enc, 4, y);
+                set_u32(&enc, 5, self.shape.nrows as u32);
+                dispatch_lines(
+                    &enc,
+                    self.row_kernel,
+                    &self.device,
+                    pipeline,
+                    self.shape.nrows,
+                );
+            }
+        }
+        enc.endEncoding();
+        submit_and_wait(cb, "SpMV", &mut scratch.completion)?;
+        if check_canary && scratch.y_external.is_none() {
+            scratch.y.assert_intact();
+        }
+        Ok(())
+    }
+
+    fn dispatch_fused(
+        &self,
+        scratch: &mut Scratch,
+        params: LifParams,
+        check_canary: bool,
+    ) -> Result<(), OpError> {
+        // Hybrid fused cannot run the fused kernel twice (empty rows would
+        // still LIF). Compose hybrid SpMV into `y` as currents, then LIF.
+        if self.hybrid.is_some() {
+            zero_f32_prefix(scratch.y_buf(), self.shape.nrows);
+            if scratch.y_external.is_none() {
+                scratch.y.arm();
+            }
+            self.dispatch_spmv(scratch, false)?;
+            // Inline the LIF kernel against resident v/theta and y-as-currents.
+            let pipeline = &self.device.lif;
+            let cb = self
+                .device
+                .command_buffer("hybrid fused LIF: Metal returned no command buffer")?;
+            let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
+                reason: "hybrid fused LIF: Metal returned no compute encoder",
+            })?;
+            enc.setComputePipelineState(pipeline);
+            set_buf(&enc, 0, &scratch.v.buffer);
+            set_buf(&enc, 1, &scratch.theta.buffer);
+            set_buf(&enc, 2, scratch.y_buf());
+            set_buf(&enc, 3, &scratch.spikes.buffer);
+            set_f32(&enc, 4, params.decay());
+            set_f32(&enc, 5, params.v_reset());
+            set_f32(&enc, 6, params.delta_theta());
+            set_u32(&enc, 7, self.shape.nrows as u32);
+            let tg = self.device.threadgroup_for(pipeline);
+            enc.dispatchThreads_threadsPerThreadgroup(size(self.shape.nrows), size(tg));
+            enc.endEncoding();
+            submit_and_wait(cb, "hybrid fused LIF", &mut scratch.completion)?;
+            if check_canary {
+                scratch.v.assert_intact();
+                scratch.theta.assert_intact();
+                scratch.spikes.assert_intact();
+            }
+            return Ok(());
+        }
+
+        let pipeline = &self.device.tier(self.row_kernel).fused;
+        let cb = self
+            .device
+            .command_buffer("fused SpMV+LIF: Metal returned no command buffer")?;
+        let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
+            reason: "fused SpMV+LIF: Metal returned no compute encoder",
         })?;
         enc.setComputePipelineState(pipeline);
         set_buf(&enc, 0, &self.row_ptr);
         set_buf(&enc, 1, &self.col);
-        set_buf(&enc, 2, values);
-        set_buf(&enc, 3, &scratch.x);
-        set_buf(&enc, 4, &scratch.y.buffer);
-        set_u32(&enc, 5, self.shape.nrows as u32);
+        set_buf(&enc, 2, &self.values);
+        set_buf(&enc, 3, scratch.x_buf());
+        set_buf(&enc, 4, &scratch.v.buffer);
+        set_buf(&enc, 5, &scratch.theta.buffer);
+        set_buf(&enc, 6, &scratch.spikes.buffer);
+        set_f32(&enc, 7, params.decay());
+        set_f32(&enc, 8, params.v_reset());
+        set_f32(&enc, 9, params.delta_theta());
+        set_u32(&enc, 10, self.shape.nrows as u32);
         dispatch_lines(
             &enc,
             self.row_kernel,
@@ -1294,11 +2046,12 @@ impl MetalSparse {
             self.shape.nrows,
         );
         enc.endEncoding();
-        submit_and_wait(cb, "SpMV", &mut scratch.completion)?;
-
-        scratch.y.assert_intact();
-        read_into(&scratch.y.buffer, y);
-        drop(guard);
+        submit_and_wait(cb, "fused SpMV+LIF", &mut scratch.completion)?;
+        if check_canary {
+            scratch.v.assert_intact();
+            scratch.theta.assert_intact();
+            scratch.spikes.assert_intact();
+        }
         Ok(())
     }
 
@@ -1384,40 +2137,59 @@ impl MetalSparse {
         let max_tg = self
             .device
             .threadgroup_for(&self.device.tier(RowKernel::Scalar).spmm);
-        let cb = command_buffer(&self.device.queue, "SpMM: Metal returned no command buffer")?;
+        let cb = self.device.command_buffer("SpMM: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "SpMM: Metal returned no compute encoder",
         })?;
-        // The batch kernel must match whatever plain SpMV selected. Every
-        // column of a batch is documented and tested as bit-identical to the
-        // single-vector product on the same backend, and that holds only while
-        // both reduce a row the same way.
-        let pipeline = &self.device.tier(self.row_kernel).spmm;
-        enc.setComputePipelineState(pipeline);
-        set_buf(&enc, 0, &self.row_ptr);
-        set_buf(&enc, 1, &self.col);
-        set_buf(&enc, 2, &self.values);
-        set_buf(&enc, 3, &batch.x);
-        set_buf(&enc, 4, &batch.y.buffer);
-        set_u32(&enc, 5, self.shape.nrows as u32);
-        set_u32(&enc, 6, n_vec as u32);
-        match self.row_kernel {
-            RowKernel::Scalar => {
-                // The two-dimensional one-thread-per-output kernel takes its
-                // position from the grid, so it is dispatched non-uniformly.
-                let (grid, threads) = spmm_geometry(self.shape.nrows, n_vec, max_tg);
-                enc.dispatchThreads_threadsPerThreadgroup(grid, threads);
-            }
-            RowKernel::Vec8 | RowKernel::Simd => {
-                // One team per row, batch handled inside the kernel, so this
-                // is the same one-dimensional geometry plain SpMV uses.
-                dispatch_lines(
-                    &enc,
-                    self.row_kernel,
+        match self.hybrid.as_ref() {
+            Some(hybrid) => {
+                encode_hybrid_spmm_side(
                     &self.device,
-                    pipeline,
+                    &enc,
+                    &hybrid.long,
+                    &batch.x,
+                    &batch.y.buffer,
                     self.shape.nrows,
-                );
+                    n_vec,
+                    max_tg,
+                )?;
+                encode_hybrid_spmm_side(
+                    &self.device,
+                    &enc,
+                    &hybrid.short,
+                    &batch.x,
+                    &batch.y.buffer,
+                    self.shape.nrows,
+                    n_vec,
+                    max_tg,
+                )?;
+            }
+            None => {
+                // The batch kernel must match whatever plain SpMV selected.
+                let pipeline = &self.device.tier(self.row_kernel).spmm;
+                enc.setComputePipelineState(pipeline);
+                set_buf(&enc, 0, &self.row_ptr);
+                set_buf(&enc, 1, &self.col);
+                set_buf(&enc, 2, &self.values);
+                set_buf(&enc, 3, &batch.x);
+                set_buf(&enc, 4, &batch.y.buffer);
+                set_u32(&enc, 5, self.shape.nrows as u32);
+                set_u32(&enc, 6, n_vec as u32);
+                match self.row_kernel {
+                    RowKernel::Scalar => {
+                        let (grid, threads) = spmm_geometry(self.shape.nrows, n_vec, max_tg);
+                        enc.dispatchThreads_threadsPerThreadgroup(grid, threads);
+                    }
+                    RowKernel::Vec8 | RowKernel::Simd => {
+                        dispatch_lines(
+                            &enc,
+                            self.row_kernel,
+                            &self.device,
+                            pipeline,
+                            self.shape.nrows,
+                        );
+                    }
+                }
             }
         }
         enc.endEncoding();
@@ -1445,31 +2217,49 @@ impl MetalSparse {
         write_from(&scratch.x_spikes, &spikes[..words]);
         scratch.y.write(y);
 
-        let pipeline = &self.device.tier(self.row_kernel).spmv_spikes;
-        let cb = command_buffer(
-            &self.device.queue,
-            "spike SpMV: Metal returned no command buffer",
-        )?;
+        let cb = self
+            .device
+            .command_buffer("spike SpMV: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "spike SpMV: Metal returned no compute encoder",
         })?;
-        enc.setComputePipelineState(pipeline);
-        set_buf(&enc, 0, &self.row_ptr);
-        set_buf(&enc, 1, &self.col);
-        // Deliberately `values`, never `values_narrow`: the spike path is
-        // bit-identical to the dense one, and reading quantised weights here
-        // would quietly make that false.
-        set_buf(&enc, 2, &self.values);
-        set_buf(&enc, 3, &scratch.x_spikes);
-        set_buf(&enc, 4, &scratch.y.buffer);
-        set_u32(&enc, 5, self.shape.nrows as u32);
-        dispatch_lines(
-            &enc,
-            self.row_kernel,
-            &self.device,
-            pipeline,
-            self.shape.nrows,
-        );
+        match self.hybrid.as_ref() {
+            Some(hybrid) => {
+                encode_hybrid_spikes_side(
+                    &self.device,
+                    &enc,
+                    &hybrid.long,
+                    &scratch.x_spikes,
+                    &scratch.y.buffer,
+                    self.shape.nrows,
+                )?;
+                encode_hybrid_spikes_side(
+                    &self.device,
+                    &enc,
+                    &hybrid.short,
+                    &scratch.x_spikes,
+                    &scratch.y.buffer,
+                    self.shape.nrows,
+                )?;
+            }
+            None => {
+                let pipeline = &self.device.tier(self.row_kernel).spmv_spikes;
+                enc.setComputePipelineState(pipeline);
+                set_buf(&enc, 0, &self.row_ptr);
+                set_buf(&enc, 1, &self.col);
+                set_buf(&enc, 2, &self.values);
+                set_buf(&enc, 3, &scratch.x_spikes);
+                set_buf(&enc, 4, &scratch.y.buffer);
+                set_u32(&enc, 5, self.shape.nrows as u32);
+                dispatch_lines(
+                    &enc,
+                    self.row_kernel,
+                    &self.device,
+                    pipeline,
+                    self.shape.nrows,
+                );
+            }
+        }
         enc.endEncoding();
         submit_and_wait(cb, "spike SpMV", &mut scratch.completion)?;
 
@@ -1509,29 +2299,54 @@ impl MetalSparse {
         write_from(xt, &x[..self.shape.nrows]);
         yt.write(y);
 
-        let pipeline = &self.device.tier(self.col_kernel).spmv_t;
-        let cb = command_buffer(
-            &self.device.queue,
-            "transpose SpMV: Metal returned no command buffer",
-        )?;
+        let cb = self
+            .device
+            .command_buffer("transpose SpMV: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "transpose SpMV: Metal returned no compute encoder",
         })?;
-        enc.setComputePipelineState(pipeline);
-        set_buf(&enc, 0, &idx.col_ptr);
-        set_buf(&enc, 1, &idx.row);
-        set_buf(&enc, 2, &idx.edge_idx);
-        set_buf(&enc, 3, &self.values);
-        set_buf(&enc, 4, xt);
-        set_buf(&enc, 5, &yt.buffer);
-        set_u32(&enc, 6, self.shape.ncols as u32);
-        dispatch_lines(
-            &enc,
-            self.col_kernel,
-            &self.device,
-            pipeline,
-            self.shape.ncols,
-        );
+        match self.hybrid_t.as_ref() {
+            Some(hybrid) => {
+                encode_transpose_side(
+                    &self.device,
+                    &enc,
+                    &hybrid.long,
+                    hybrid.long_kernel,
+                    &self.values,
+                    xt,
+                    &yt.buffer,
+                    self.shape.ncols,
+                )?;
+                encode_transpose_side(
+                    &self.device,
+                    &enc,
+                    &hybrid.short,
+                    hybrid.short_kernel,
+                    &self.values,
+                    xt,
+                    &yt.buffer,
+                    self.shape.ncols,
+                )?;
+            }
+            None => {
+                let pipeline = &self.device.tier(self.col_kernel).spmv_t;
+                enc.setComputePipelineState(pipeline);
+                set_buf(&enc, 0, &idx.col_ptr);
+                set_buf(&enc, 1, &idx.row);
+                set_buf(&enc, 2, &idx.edge_idx);
+                set_buf(&enc, 3, &self.values);
+                set_buf(&enc, 4, xt);
+                set_buf(&enc, 5, &yt.buffer);
+                set_u32(&enc, 6, self.shape.ncols as u32);
+                dispatch_lines(
+                    &enc,
+                    self.col_kernel,
+                    &self.device,
+                    pipeline,
+                    self.shape.ncols,
+                );
+            }
+        }
         enc.endEncoding();
         submit_and_wait(cb, "transpose SpMV", &mut scratch.completion)?;
 
@@ -1555,50 +2370,15 @@ impl MetalSparse {
         })?;
         let scratch = &mut *guard;
         ensure_device_healthy()?;
-        write_from(&scratch.x, &x[..self.shape.ncols]);
+        if scratch.x_external.is_none() {
+            write_from(&scratch.x, &x[..self.shape.ncols]);
+        }
         scratch.v.write(v);
         scratch.theta.write(theta);
+        self.dispatch_fused(scratch, params, true)?;
 
-        // The fused kernel runs at the operator's SpMV width, so its row
-        // reduction is the one plain SpMV performs.
-        let pipeline = &self.device.tier(self.row_kernel).fused;
-
-        let cb = command_buffer(
-            &self.device.queue,
-            "fused SpMV+LIF: Metal returned no command buffer",
-        )?;
-        let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
-            reason: "fused SpMV+LIF: Metal returned no compute encoder",
-        })?;
-        enc.setComputePipelineState(pipeline);
-        set_buf(&enc, 0, &self.row_ptr);
-        set_buf(&enc, 1, &self.col);
-        set_buf(&enc, 2, &self.values);
-        set_buf(&enc, 3, &scratch.x);
-        set_buf(&enc, 4, &scratch.v.buffer);
-        set_buf(&enc, 5, &scratch.theta.buffer);
-        set_buf(&enc, 6, &scratch.spikes.buffer);
-        set_f32(&enc, 7, params.decay());
-        set_f32(&enc, 8, params.v_reset());
-        set_f32(&enc, 9, params.delta_theta());
-        set_u32(&enc, 10, self.shape.nrows as u32);
-        dispatch_lines(
-            &enc,
-            self.row_kernel,
-            &self.device,
-            pipeline,
-            self.shape.nrows,
-        );
-        enc.endEncoding();
-        submit_and_wait(cb, "fused SpMV+LIF", &mut scratch.completion)?;
-
-        scratch.v.assert_intact();
-        scratch.theta.assert_intact();
-        scratch.spikes.assert_intact();
         read_into(&scratch.v.buffer, v);
         read_into(&scratch.theta.buffer, theta);
-        // Split the borrow: the staging vec is `&mut` while the buffer it is
-        // filled from is `&`, and both live in the same guard.
         let Scratch {
             spikes: spikes_buf,
             spikes_host,
@@ -1616,6 +2396,174 @@ impl MetalSparse {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hybrid_spmm_side(
+    device: &MetalDevice,
+    enc: &ComputeEncoder,
+    side: &HybridSide,
+    x: &Buffer,
+    y: &Buffer,
+    nrows: usize,
+    n_vec: usize,
+    max_tg: usize,
+) -> Result<(), OpError> {
+    let pipeline = &device.tier(side.kernel).spmm;
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &side.row_ptr);
+    set_buf(enc, 1, &side.col);
+    set_buf(enc, 2, &side.values);
+    set_buf(enc, 3, x);
+    set_buf(enc, 4, y);
+    set_u32(enc, 5, nrows as u32);
+    set_u32(enc, 6, n_vec as u32);
+    match side.kernel {
+        RowKernel::Scalar => {
+            let (grid, threads) = spmm_geometry(nrows, n_vec, max_tg);
+            enc.dispatchThreads_threadsPerThreadgroup(grid, threads);
+        }
+        RowKernel::Vec8 | RowKernel::Simd => {
+            dispatch_lines(enc, side.kernel, device, pipeline, nrows);
+        }
+    }
+    Ok(())
+}
+
+fn encode_hybrid_spikes_side(
+    device: &MetalDevice,
+    enc: &ComputeEncoder,
+    side: &HybridSide,
+    spikes: &Buffer,
+    y: &Buffer,
+    nrows: usize,
+) -> Result<(), OpError> {
+    let pipeline = &device.tier(side.kernel).spmv_spikes;
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &side.row_ptr);
+    set_buf(enc, 1, &side.col);
+    // Deliberately `values`, never `values_narrow`: spike path stays
+    // bit-identical to the dense one.
+    set_buf(enc, 2, &side.values);
+    set_buf(enc, 3, spikes);
+    set_buf(enc, 4, y);
+    set_u32(enc, 5, nrows as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, nrows);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_transpose_side(
+    device: &MetalDevice,
+    enc: &ComputeEncoder,
+    idx: &TransposeIndex,
+    kernel: RowKernel,
+    values: &Buffer,
+    x: &Buffer,
+    y: &Buffer,
+    ncols: usize,
+) -> Result<(), OpError> {
+    let pipeline = &device.tier(kernel).spmv_t;
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &idx.col_ptr);
+    set_buf(enc, 1, &idx.row);
+    set_buf(enc, 2, &idx.edge_idx);
+    set_buf(enc, 3, values);
+    set_buf(enc, 4, x);
+    set_buf(enc, 5, y);
+    set_u32(enc, 6, ncols as u32);
+    dispatch_lines(enc, kernel, device, pipeline, ncols);
+    Ok(())
+}
+
+fn zero_f32_prefix(buffer: &Buffer, elems: usize) {
+    if elems == 0 {
+        return;
+    }
+    let bytes = elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .expect("zero_f32_prefix length overflow");
+    assert!(
+        buffer.length() >= bytes,
+        "sparsl: scratch buffer holds {} bytes, tried to zero {bytes}",
+        buffer.length()
+    );
+    // SAFETY: shared buffer, length checked; zeroing resident scratch is not a
+    // caller-slice host copy (and must not trip the resident-path probe).
+    unsafe {
+        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0, bytes);
+    }
+}
+
+fn refresh_hybrid_side(
+    side: &HybridSide,
+    weights: &[f32],
+    precision: super::WeightPrecision,
+) -> Result<(), OpError> {
+    let mut packed = Vec::with_capacity(side.src_edges.iter().map(|&(s, e)| e - s).sum());
+    for &(s, e) in &side.src_edges {
+        packed.extend_from_slice(&weights[s..e]);
+    }
+    write_from(&side.values, &packed);
+    if let (Some(buffer), Some(bits)) = (side.values_narrow.as_ref(), precision.narrow_bits(&packed))
+    {
+        write_from(buffer, &bits);
+    }
+    Ok(())
+}
+
+fn encode_hybrid_spmv_side(
+    device: &MetalDevice,
+    enc: &ComputeEncoder,
+    side: &HybridSide,
+    precision: super::WeightPrecision,
+    x: &Buffer,
+    y: &Buffer,
+    nrows: usize,
+) -> Result<(), OpError> {
+    let tier = device.tier(side.kernel);
+    let (pipeline, values) = match (precision, side.values_narrow.as_ref()) {
+        (super::WeightPrecision::F16, Some(narrow)) => (&tier.spmv_f16, narrow),
+        (super::WeightPrecision::Bf16, Some(narrow)) => (&tier.spmv_bf16, narrow),
+        _ => (&tier.spmv, &side.values),
+    };
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &side.row_ptr);
+    set_buf(enc, 1, &side.col);
+    set_buf(enc, 2, values);
+    set_buf(enc, 3, x);
+    set_buf(enc, 4, y);
+    set_u32(enc, 5, nrows as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, nrows);
+    Ok(())
+}
+
+fn encode_hybrid_spmv(
+    op: &MetalSparse,
+    enc: &ComputeEncoder,
+    hybrid: &HybridForward,
+    x: &Buffer,
+    y: &Buffer,
+) -> Result<(), OpError> {
+    encode_hybrid_spmv_side(
+        &op.device,
+        enc,
+        &hybrid.long,
+        op.precision,
+        x,
+        y,
+        op.shape.nrows,
+    )?;
+    encode_hybrid_spmv_side(
+        &op.device,
+        enc,
+        &hybrid.short,
+        op.precision,
+        x,
+        y,
+        op.shape.nrows,
+    )?;
+    Ok(())
+}
 
 /// Dispatch a line-parallel kernel at the operator's selected width.
 ///
@@ -1822,8 +2770,10 @@ fn wait_for_completion_with_timeout(
 
 /// Finish the ownership handoff after completion polling.
 ///
-/// Generic only so the retention invariant can be tested with a drop sentinel;
-/// production passes [`RetainedCommandBuffer`].
+/// Generic only so the retention invariant can be tested with a drop sentinel.
+/// Production [`submit_and_wait`] records timed-out buffers for [`reset_runtime`]
+/// instead of forgetting them unconditionally.
+#[cfg(test)]
 fn finalize_retained_wait<T>(
     retained: T,
     result: Result<(), CompletionWaitError>,
@@ -1842,12 +2792,13 @@ fn finalize_retained_wait<T>(
 /// then reject every terminal state except a successful completion before any
 /// host-visible output is read.
 ///
-/// A non-terminal timeout leaks one retained command buffer deliberately. Its
+/// A non-terminal timeout retains one command buffer deliberately. Its
 /// resources may still be in use and Metal has no cancellation API, so freeing
 /// or reusing them would be unsound. No additional selector is invoked after
 /// timeout classification: even if the command becomes terminal immediately
-/// afterwards, conservative retention lasts until process exit. Process-wide
-/// quarantine prevents all later admission.
+/// afterwards, conservative retention lasts until [`reset_runtime`] observes a
+/// terminal status (or process exit). Process-wide quarantine prevents all
+/// later admission until that reset succeeds.
 fn submit_and_wait(
     cb: RetainedCommandBuffer,
     operation: &'static str,
@@ -1874,7 +2825,17 @@ fn submit_and_wait(
         METAL_COMMAND_TIMEOUT,
         (&*completion.event, value),
     );
-    finalize_retained_wait(cb, wait)
+    match wait {
+        Ok(()) => Ok(()),
+        Err(CompletionWaitError::Terminal(error)) => Err(error),
+        Err(CompletionWaitError::TimedOut(error)) => {
+            TIMED_OUT_COMMANDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(cb);
+            Err(error)
+        }
+    }
 }
 
 /// Two-dimensional SpMM dispatch geometry.
@@ -1950,6 +2911,10 @@ fn write_from<T: Copy>(buffer: &Buffer, src: &[T]) {
     if src.is_empty() {
         return;
     }
+    #[cfg(test)]
+    {
+        note_host_copy();
+    }
     let bytes = std::mem::size_of_val(src);
     assert!(
         buffer.length() >= bytes,
@@ -1982,6 +2947,10 @@ fn read_into<T: Copy>(buffer: &Buffer, dst: &mut [T]) {
 fn read_buffer_into<T: Copy>(buffer: &Buffer, dst: &mut [T]) {
     if dst.is_empty() {
         return;
+    }
+    #[cfg(test)]
+    {
+        note_host_copy();
     }
     let bytes = std::mem::size_of_val(dst);
     assert!(
@@ -2426,7 +3395,11 @@ mod tests {
             println!("{QUARANTINE_UNAVAILABLE_MARKER}");
             return;
         };
-        let queue = raw_device.queue.clone();
+        let queue = raw_device
+            .queue
+            .lock()
+            .expect("Metal command queue mutex")
+            .clone();
         let device = crate::Device::try_new(crate::Backend::Metal)
             .expect("shared Metal device opened directly above");
         let csr = Csr::from_adjacency(&[vec![0u32]]);
@@ -2443,7 +3416,7 @@ mod tests {
         let weights_before = resident_weight_bytes(&op);
         let weights_f16_before = resident_weight_bytes(&op_f16);
         let weights_bf16_before = resident_weight_bytes(&op_bf16);
-        let empty_csr = Csr::empty(0);
+        let empty_csr = Csr::empty(0, 0);
         let empty_op = device
             .prepare(&empty_csr, 0, &[])
             .expect("prepare zero-work operator before injected quarantine");
@@ -2596,6 +3569,120 @@ mod tests {
         panic!("quarantine child exited without an execution marker: {logs}");
     }
 
+    const RESET_CHILD_ENV: &str = "SPARSL_INTERNAL_METAL_RESET_TEST_CHILD";
+    const RESET_CHILD_TOKEN: &str = "sparsl-metal-reset-v1";
+    const RESET_PASS_MARKER: &str = "SPARSL_METAL_RESET_EXECUTED";
+    const RESET_UNAVAILABLE_MARKER: &str = "SPARSL_METAL_RESET_UNAVAILABLE";
+
+    fn run_metal_reset_child() {
+        let Ok(_) = shared_device() else {
+            println!("{RESET_UNAVAILABLE_MARKER}");
+            return;
+        };
+
+        // Injected quarantine with no retained timed-out CB: reset must clear it.
+        METAL_ADMISSION.publish_quarantine();
+        assert_eq!(unavailable_reason(), Some(METAL_QUARANTINED_REASON));
+        reset_runtime().expect("reset with no timed-out CB must succeed");
+        assert_eq!(
+            quarantine_reason(&METAL_ADMISSION),
+            None,
+            "reset must clear quarantine when no timed-out CB is retained"
+        );
+        shared_device().expect("shared device must open after a successful reset");
+
+        // A non-terminal retained CB must keep quarantine and refuse reset.
+        let device = shared_device().expect("device after first reset");
+        let queue = device
+            .queue
+            .lock()
+            .expect("queue mutex")
+            .clone();
+        let stuck = command_buffer(&queue, "non-terminal reset fixture")
+            .expect("allocate uncommitted command buffer");
+        assert_eq!(
+            stuck.status(),
+            MTLCommandBufferStatus::NotEnqueued,
+            "fixture must start non-terminal"
+        );
+        TIMED_OUT_COMMANDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(stuck);
+        METAL_ADMISSION.publish_quarantine();
+        assert_eq!(
+            reset_runtime(),
+            Err(MetalResetError::NonTerminalCommand),
+            "reset must refuse while a timed-out CB is non-terminal"
+        );
+        assert_eq!(
+            quarantine_reason(&METAL_ADMISSION),
+            Some(METAL_QUARANTINED_REASON),
+            "refused reset must leave quarantine published"
+        );
+
+        // Drop the non-terminal fixture so the child can exit without leaking
+        // process-wide quarantine into other tests in this binary — this child
+        // is isolated, but clearing keeps the marker path honest.
+        TIMED_OUT_COMMANDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        // Active admission blocks reset even with no timed-out CB.
+        METAL_ADMISSION.clear_quarantine();
+        let _permit = METAL_ADMISSION.try_admit().expect("admit for reset refusal");
+        assert_eq!(
+            reset_runtime(),
+            Err(MetalResetError::ActiveAdmissions { count: 1 })
+        );
+        drop(_permit);
+
+        // Terminal retained CB: reset clears and admits again.
+        let terminal = command_buffer(&queue, "terminal reset fixture")
+            .expect("allocate command buffer");
+        // Never committed: still NotEnqueued. Record it, then remove after we
+        // have exercised the non-terminal path above. For the success path,
+        // push nothing — empty timed-out list is the common recovery case.
+        METAL_ADMISSION.publish_quarantine();
+        reset_runtime().expect("reset with empty timed-out list must succeed");
+        assert!(
+            quarantine_reason(&METAL_ADMISSION).is_none(),
+            "successful reset clears quarantine"
+        );
+        let _ = terminal;
+        crate::Device::try_new(crate::Backend::Metal)
+            .expect("Device::try_new must work after Device::reset_metal / reset_runtime");
+        println!("{RESET_PASS_MARKER}");
+    }
+
+    /// Quarantine recovery is process-wide and destructive; run it in an
+    /// isolated child the same way the propagation suite does.
+    #[test]
+    fn metal_reset_clears_quarantine_only_when_fail_closed_conditions_hold() {
+        if std::env::var(RESET_CHILD_ENV).as_deref() == Ok(RESET_CHILD_TOKEN) {
+            run_metal_reset_child();
+            return;
+        }
+
+        let output = run_isolated_test(
+            "backend::metal::tests::metal_reset_clears_quarantine_only_when_fail_closed_conditions_hold",
+            RESET_CHILD_ENV,
+            RESET_CHILD_TOKEN,
+            Duration::from_secs(90),
+        );
+        let logs = child_logs(&output);
+        assert!(output.status.success(), "Metal reset child failed: {logs}");
+        if logs.contains(RESET_PASS_MARKER) {
+            return;
+        }
+        if logs.contains(RESET_UNAVAILABLE_MARKER) {
+            eprintln!("Metal unavailable; physical Metal reset explicitly skipped");
+            return;
+        }
+        panic!("Metal reset child exited without an execution marker: {logs}");
+    }
+
     #[test]
     fn spmm_geometry_maps_vectors_to_x_and_rows_to_y_without_overflow() {
         for &(rows, vectors, cap) in &[
@@ -2642,7 +3729,9 @@ mod tests {
         let adjacency: Vec<Vec<u32>> = (0..NROWS)
             .map(|r| vec![((r * 5 + 1) % NCOLS) as u32])
             .collect();
-        let csr = Csr::from_adjacency(&adjacency);
+        let built = Csr::from_adjacency(&adjacency);
+        let csr = Csr::from_parts(built.row_ptr().to_vec(), built.col().to_vec(), NCOLS)
+            .expect("physical-cap fixture ncols");
         let weights: Vec<f32> = (0..NROWS)
             .map(|r| [0.5f32, -0.25, 1.0, -2.0][r % 4])
             .collect();
@@ -2677,7 +3766,7 @@ mod tests {
                 .expect("SpMM must split widths above the physical pipeline cap");
 
             for (r, &weight) in weights.iter().enumerate() {
-                let col = csr.col[csr.row_ptr[r] as usize] as usize;
+                let col = csr.col()[csr.row_ptr()[r] as usize] as usize;
                 for v in 0..n_vec {
                     let i = r * n_vec + v;
                     let want = seed[i] + weight * x[col * n_vec + v];
@@ -2812,7 +3901,9 @@ mod tests {
                 (0..len).map(|j| ((r + j) % ncols) as u32).collect()
             })
             .collect();
-        let csr = Csr::from_adjacency(&adjacency);
+        let built = Csr::from_adjacency(&adjacency);
+        let csr = Csr::from_parts(built.row_ptr().to_vec(), built.col().to_vec(), ncols)
+            .expect("team fixture ncols");
         let weights: Vec<f32> = (0..csr.nnz())
             .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.0625)
             .collect();
@@ -2820,7 +3911,7 @@ mod tests {
     }
 
     fn longest_row(csr: &Csr) -> usize {
-        csr.row_ptr
+        csr.row_ptr()
             .windows(2)
             .map(|b| (b[1] - b[0]) as usize)
             .max()
@@ -3180,7 +4271,13 @@ mod tests {
                         (0..deg).map(|_| rng.gen_index(ncols) as u32).collect()
                     })
                     .collect();
-                let csr = Csr::from_adjacency(&adjacency);
+                let built = Csr::from_adjacency(&adjacency);
+                let csr = Csr::from_parts(
+                    built.row_ptr().to_vec(),
+                    built.col().to_vec(),
+                    ncols,
+                )
+                .expect("tier-sweep fixture ncols");
                 let weights: Vec<f32> = (0..csr.nnz()).map(|_| rng.next_f32() - 0.5).collect();
                 let x: Vec<f32> = (0..ncols).map(|_| rng.next_f32() - 0.5).collect();
                 let seed: Vec<f32> = (0..nrows).map(|_| rng.next_f32() - 0.5).collect();
@@ -3269,5 +4366,287 @@ mod tests {
             seen[1],
             seen[2]
         );
+    }
+
+    fn skewed_hub_csr(nrows: usize, hub_nnz: usize, leaf_nnz: usize) -> (Csr, Vec<f32>) {
+        let mut adj = vec![Vec::new(); nrows];
+        let ncols = nrows.max(hub_nnz).max(1);
+        for (r, row) in adj.iter_mut().enumerate().take(nrows.min(4)) {
+            let mut cols: Vec<u32> = (0..hub_nnz as u32)
+                .map(|i| (i * 3 + r as u32) % ncols as u32)
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            while cols.len() < hub_nnz.min(ncols) {
+                let c = (cols.len() as u32 * 7 + r as u32) % ncols as u32;
+                if !cols.contains(&c) {
+                    cols.push(c);
+                } else {
+                    break;
+                }
+            }
+            cols.sort_unstable();
+            *row = cols;
+        }
+        for (r, row) in adj.iter_mut().enumerate().skip(4) {
+            let mut cols = Vec::with_capacity(leaf_nnz);
+            for i in 0..leaf_nnz {
+                cols.push(((r * 3 + i) % ncols) as u32);
+            }
+            cols.sort_unstable();
+            cols.dedup();
+            *row = cols;
+        }
+        let csr = Csr::from_adjacency(&adj);
+        let weights: Vec<f32> = (0..csr.nnz())
+            .map(|i| ((i % 17) as f32) * 0.05 + 0.1)
+            .collect();
+        (csr, weights)
+    }
+
+    #[test]
+    fn resident_spmv_does_not_host_copy_on_the_hot_path() {
+        let Ok(device) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let csr = Csr::from_adjacency(&[vec![1, 2], vec![0], vec![0, 1]]);
+        let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let op = device.prepare(&csr, 3, &weights).expect("prepare");
+        let x = vec![0.5, 1.0, 1.5];
+        let y0 = vec![0.0; 3];
+        op.write_x(&x).expect("write_x");
+        op.write_y(&y0).expect("write_y");
+        begin_host_copy_probe();
+        op.spmv_resident().expect("resident");
+        assert_eq!(
+            end_host_copy_probe(),
+            0,
+            "resident SpMV must not write_from/read_into on the hot path"
+        );
+        let mut y = y0.clone();
+        begin_host_copy_probe();
+        op.sync_y(&mut y).expect("sync");
+        assert!(end_host_copy_probe() >= 1);
+        let mut y_slice = y0;
+        op.spmv(&x, &mut y_slice).expect("slice");
+        assert_eq!(y, y_slice);
+    }
+
+    #[test]
+    fn resident_fused_does_not_host_copy_on_the_hot_path() {
+        let Ok(device) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let csr = Csr::from_adjacency(&[vec![1, 2], vec![0], vec![0, 1]]);
+        let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let op = device.prepare(&csr, 3, &weights).expect("prepare");
+        let x = vec![0.5, 1.0, 1.5];
+        let params = crate::LifParams::new(0.9, 0.0, 0.1).expect("params");
+        let v0 = vec![0.1, 0.2, 0.3];
+        let th0 = vec![1.0; 3];
+        op.write_x(&x).expect("write_x");
+        op.write_lif_state(&v0, &th0).expect("write_lif");
+        begin_host_copy_probe();
+        op.fused_spmv_lif_resident(params).expect("resident");
+        assert_eq!(end_host_copy_probe(), 0);
+        let mut v = v0.clone();
+        let mut theta = th0.clone();
+        let mut spikes = vec![false; 3];
+        begin_host_copy_probe();
+        op.sync_lif_state(&mut v, &mut theta, &mut spikes)
+            .expect("sync");
+        assert!(end_host_copy_probe() >= 1);
+        let mut v_s = v0;
+        let mut th_s = th0;
+        let mut sp_s = vec![false; 3];
+        op.fused_spmv_lif(&x, &mut v_s, &mut th_s, &mut sp_s, params)
+            .expect("slice");
+        assert_eq!(v, v_s);
+        assert_eq!(theta, th_s);
+        assert_eq!(spikes, sp_s);
+    }
+
+    #[test]
+    fn hybrid_triggers_on_degree_skew_and_matches_cpu() {
+        let Ok(metal) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let cpu = crate::Device::cpu_sequential();
+        let (csr, weights) = skewed_hub_csr(256, 128, 2);
+        let mean = csr.nnz() / csr.nrows().max(1);
+        let max_row = longest_row(&csr);
+        assert!(
+            max_row / mean.max(1) > 16,
+            "fixture must be skewed: max={max_row} mean={mean}"
+        );
+        let op_m = metal
+            .prepare_with_transpose(&csr, csr.ncols(), &weights)
+            .expect("metal");
+        let op_c = cpu
+            .prepare_with_transpose(&csr, csr.ncols(), &weights)
+            .expect("cpu");
+        assert!(
+            op_m.is_hybrid_forward(),
+            "skewed fixture must select the two-CSR hybrid"
+        );
+
+        let x: Vec<f32> = (0..csr.ncols()).map(|i| (i % 5) as f32 * 0.2).collect();
+        let mut y_m = vec![0.25f32; csr.nrows()];
+        let mut y_c = y_m.clone();
+        op_m.spmv(&x, &mut y_m).expect("metal spmv");
+        op_c.spmv(&x, &mut y_c).expect("cpu spmv");
+        let tol = crate::tolerance_for_spmv(op_m.shape().max_row_nnz(), 1.0, 1.0);
+        for (i, (a, b)) in y_m.iter().zip(y_c.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= tol,
+                "hybrid SpMV row {i}: metal={a} cpu={b} tol={tol}"
+            );
+        }
+
+        let n_vec = 4usize;
+        let x_b: Vec<f32> = (0..csr.ncols() * n_vec)
+            .map(|i| (i % 7) as f32 * 0.1)
+            .collect();
+        let mut y_bm = vec![0.1f32; csr.nrows() * n_vec];
+        let mut y_bc = y_bm.clone();
+        op_m.spmm(&x_b, n_vec, &mut y_bm).expect("metal spmm");
+        op_c.spmm(&x_b, n_vec, &mut y_bc).expect("cpu spmm");
+        for (i, (a, b)) in y_bm.iter().zip(y_bc.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= tol,
+                "hybrid SpMM elem {i}: metal={a} cpu={b}"
+            );
+        }
+
+        let xt: Vec<f32> = (0..csr.nrows()).map(|i| (i % 3) as f32 * 0.5).collect();
+        let mut yt_m = vec![0.0f32; csr.ncols()];
+        let mut yt_c = yt_m.clone();
+        op_m.spmv_t(&xt, &mut yt_m).expect("metal t");
+        op_c.spmv_t(&xt, &mut yt_c).expect("cpu t");
+        let tol_t = crate::tolerance_for_spmv(max_row.max(1), 1.0, 1.0);
+        for (i, (a, b)) in yt_m.iter().zip(yt_c.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= tol_t,
+                "hybrid transpose col {i}: metal={a} cpu={b}"
+            );
+        }
+
+        let params = crate::LifParams::new(0.95, 0.0, 0.05).expect("params");
+        let mut v_m = vec![0.2f32; csr.nrows()];
+        let mut th_m = vec![1.0f32; csr.nrows()];
+        let mut sp_m = vec![false; csr.nrows()];
+        let mut v_c = v_m.clone();
+        let mut th_c = th_m.clone();
+        let mut sp_c = sp_m.clone();
+        op_m
+            .fused_spmv_lif(&x, &mut v_m, &mut th_m, &mut sp_m, params)
+            .expect("metal fused");
+        op_c
+            .fused_spmv_lif(&x, &mut v_c, &mut th_c, &mut sp_c, params)
+            .expect("cpu fused");
+        for (i, (a, b)) in v_m.iter().zip(v_c.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= tol,
+                "hybrid fused v[{i}]: metal={a} cpu={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn uniform_graph_stays_single_tier() {
+        let Ok(metal) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let mut adj = vec![vec![0u32, 1, 2]; 64];
+        for (r, row) in adj.iter_mut().enumerate() {
+            *row = vec![r as u32 % 64, (r as u32 + 1) % 64, (r as u32 + 2) % 64];
+            row.sort_unstable();
+        }
+        let csr = Csr::from_adjacency(&adj);
+        let weights = vec![1.0; csr.nnz()];
+        let op = metal.prepare(&csr, csr.ncols(), &weights).expect("prepare");
+        assert!(
+            !op.is_hybrid_forward(),
+            "uniform degree must not split into two CSRs"
+        );
+    }
+
+    #[test]
+    fn external_mtl_x_spmv_skips_host_copy_and_keeps_gpu_address() {
+        let Ok(device) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let csr = Csr::from_adjacency(&[vec![1, 2], vec![0], vec![0, 1]]);
+        let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let op = device.prepare(&csr, 3, &weights).expect("prepare");
+        let x = vec![0.5f32, 1.0, 1.5];
+        let ext = op.alloc_mtl_f32(&x).expect("alloc external x");
+        let ext_addr = ext.gpuAddress();
+        op.bind_mtl_x(ext).expect("bind");
+        assert_eq!(op.mtl_x_gpu_address().expect("addr"), ext_addr);
+
+        let y0 = vec![0.25f32, 0.0, -0.5];
+        op.write_y(&y0).expect("write_y");
+        begin_host_copy_probe();
+        op.spmv_resident().expect("resident with external x");
+        assert_eq!(
+            end_host_copy_probe(),
+            0,
+            "external-x SpMV must not write_from/read_into on the hot path"
+        );
+        let mut y_ext = y0.clone();
+        op.sync_y(&mut y_ext).expect("sync");
+
+        op.unbind_mtl_x().expect("unbind");
+        let mut y_slice = y0;
+        op.spmv(&x, &mut y_slice).expect("slice");
+        assert_eq!(y_ext, y_slice);
+
+        let short = op.alloc_mtl_f32(&[1.0f32]).expect("short");
+        assert!(op.bind_mtl_x(short).is_err(), "short external x must fail");
+    }
+
+    #[test]
+    fn shared_event_wait_and_signal_round_trip() {
+        let Ok(device) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let csr = Csr::from_adjacency(&[vec![0]]);
+        let op = device.prepare(&csr, 1, &[1.0]).expect("prepare");
+        // Host-set then wait is the documented tessl↔sparsl handoff shape when
+        // the peer has already committed (tessl signals on its Metal 4 queue).
+        let metal_dev = MTLCreateSystemDefaultDevice().expect("metal");
+        let ev = metal_dev.newSharedEvent().expect("shared event");
+        ev.setSignaledValue(7);
+        op.wait_shared_event(&ev, 7, 1_000).expect("wait");
+        op.signal_shared_event(&ev, 8).expect("signal");
+        assert_eq!(ev.signaledValue(), 8);
+    }
+
+    #[test]
+    fn shared_event_wait_timeout_fails_closed_before_spmv() {
+        let Ok(device) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let csr = Csr::from_adjacency(&[vec![0]]);
+        let op = device.prepare(&csr, 1, &[1.0]).expect("prepare");
+        let metal_dev = MTLCreateSystemDefaultDevice().expect("metal");
+        let ev = metal_dev.newSharedEvent().expect("shared event");
+        // Peer never signals value 1. timeout_ms=0 must not look like success.
+        let err = op
+            .wait_shared_event(&ev, 1, 0)
+            .expect_err("unsignaled SharedEvent must time out");
+        assert!(
+            matches!(err, OpError::Execution { .. }),
+            "timeout must be OpError::Execution, got {err}"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "timeout must name the failure, got {err}"
+        );
+        // Operator remains usable after a timed-out wait (no false quarantine).
+        let mut y = [0.0f32];
+        op.spmv(&[1.0f32], &mut y).expect("spmv after timeout");
+        assert_eq!(y[0], 1.0);
     }
 }

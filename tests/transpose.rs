@@ -83,9 +83,9 @@ fn transpose_matches_a_dense_reference() {
     // stored entry whose CSR column is `c`.
     let mut want = vec![0.0f32; ncols];
     for (r, xr) in x.iter().enumerate() {
-        let (s, e) = (csr.row_ptr[r] as usize, csr.row_ptr[r + 1] as usize);
+        let (s, e) = (csr.row_ptr()[r] as usize, csr.row_ptr()[r + 1] as usize);
         for i in s..e {
-            want[csr.col[i] as usize] += weights[i] * xr;
+            want[csr.col()[i] as usize] += weights[i] * xr;
         }
     }
 
@@ -232,5 +232,55 @@ fn transpose_rejects_wrong_operand_lengths() {
         let mut right = vec![0.0f32; ncols];
         assert!(op.spmv_t(&vec![0.0f32; nrows - 1], &mut right).is_err());
         assert!(op.spmv_t(&vec![0.0f32; nrows], &mut right).is_ok());
+    }
+}
+
+/// Narrow + transpose must be a public seam: callers previously had to choose
+/// one wrapper and lose the other. Both directions must stay within the narrow
+/// tolerance of the f32 transpose reference.
+#[test]
+fn narrow_transpose_matches_f32_transpose_within_tolerance() {
+    use sparsl::{tolerance_for_spmv_narrow, WeightPrecision};
+
+    let mut rng = Rng::new(0xF16_7A95);
+    let (nrows, ncols) = (32usize, 24usize);
+    let csr = random_csr(nrows, ncols, 5, &mut rng);
+    let weights = random_vec(csr.nnz(), 1.0, &mut rng);
+    let x = random_vec(nrows, 1.0, &mut rng);
+
+    for device in devices() {
+        let f32_op = device
+            .prepare_with_transpose(&csr, ncols, &weights)
+            .expect("f32 transpose");
+        let mut y_ref = vec![0.0f32; ncols];
+        f32_op.spmv_t(&x, &mut y_ref).expect("f32 spmv_t");
+
+        for precision in [WeightPrecision::F16, WeightPrecision::Bf16] {
+            let op = match precision {
+                WeightPrecision::F16 => device
+                    .prepare_f16_with_transpose(&csr, ncols, &weights)
+                    .expect("f16 transpose"),
+                WeightPrecision::Bf16 => device
+                    .prepare_bf16_with_transpose(&csr, ncols, &weights)
+                    .expect("bf16 transpose"),
+                WeightPrecision::F32 => unreachable!(),
+            };
+            assert!(op.has_transpose(), "{precision:?} must expose spmv_t");
+            let mut y = vec![0.0f32; ncols];
+            op.spmv_t(&x, &mut y)
+                .unwrap_or_else(|e| panic!("{precision:?} spmv_t: {e}"));
+            let tol = tolerance_for_spmv_narrow(
+                precision,
+                max_col_nnz(&csr, ncols),
+                max_abs_term(&weights, &x),
+                max_abs(&y_ref).max(max_abs(&y)),
+            );
+            for (i, (got, want)) in y.iter().zip(&y_ref).enumerate() {
+                assert!(
+                    (got - want).abs() <= tol,
+                    "{precision:?} spmv_t[{i}]: got {got} want {want} tol {tol}"
+                );
+            }
+        }
     }
 }

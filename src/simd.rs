@@ -29,7 +29,9 @@ pub const LANES: usize = 8;
 /// ```
 ///
 /// All slices must have the same length. `tau` entries must be finite and
-/// non-zero. `dt` is the integer tick step, converted to `f32` for the update.
+/// non-zero. `dt` is the integer tick step, converted to `f32` for the update;
+/// values above `2^24` are refused because they are not exactly representable
+/// in `f32` and would silently change the integration step.
 ///
 /// The implementation processes `LANES`-wide chunks (SIMD-shaped) and a
 /// scalar remainder; results match [`scalar_leak_integrate`] within `1e-6`
@@ -38,8 +40,8 @@ pub fn simd_leak_integrate(v: &mut [f32], input: &[f32], tau: &[f32], dt: Tick) 
     let n = v.len();
     assert_eq!(input.len(), n, "input length must match v");
     assert_eq!(tau.len(), n, "tau length must match v");
-
-    let dt = dt as f32;
+    assert_tau_entries(tau);
+    let dt = tick_as_f32(dt);
     let mut i = 0;
 
     // SIMD-structured body: fixed lane groups for autovectorization.
@@ -68,10 +70,33 @@ pub fn scalar_leak_integrate(v: &mut [f32], input: &[f32], tau: &[f32], dt: Tick
     let n = v.len();
     assert_eq!(input.len(), n, "input length must match v");
     assert_eq!(tau.len(), n, "tau length must match v");
-    let dt = dt as f32;
+    assert_tau_entries(tau);
+    let dt = tick_as_f32(dt);
     for i in 0..n {
         leak_integrate_one(&mut v[i], input[i], tau[i], dt);
     }
+}
+
+/// Refuse non-finite or zero `tau` before any division. A zero entry produces
+/// Inf/NaN membrane updates that look like a successful step.
+fn assert_tau_entries(tau: &[f32]) {
+    for (i, &t) in tau.iter().enumerate() {
+        assert!(
+            t.is_finite() && t != 0.0,
+            "tau[{i}] must be finite and non-zero, got {t}"
+        );
+    }
+}
+
+/// Largest integer `Tick` that is exactly representable as `f32`.
+const MAX_EXACT_F32_TICK: Tick = 1 << 24;
+
+fn tick_as_f32(dt: Tick) -> f32 {
+    assert!(
+        dt <= MAX_EXACT_F32_TICK,
+        "Tick {dt} exceeds 2^24 and is not exactly representable as f32"
+    );
+    dt as f32
 }
 
 #[inline(always)]
@@ -162,5 +187,40 @@ mod tests {
     fn rejects_input_len_mismatch() {
         let mut v = [0.0f32; 4];
         simd_leak_integrate(&mut v, &[0.0; 3], &[1.0; 4], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "tau[1] must be finite and non-zero")]
+    fn simd_refuses_tau_zero() {
+        let mut v = [0.0f32; 3];
+        simd_leak_integrate(&mut v, &[1.0; 3], &[1.0, 0.0, 2.0], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "tau[0] must be finite and non-zero")]
+    fn scalar_refuses_tau_zero() {
+        let mut v = [0.0f32; 1];
+        scalar_leak_integrate(&mut v, &[1.0], &[0.0], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "tau[0] must be finite and non-zero")]
+    fn simd_refuses_tau_nan() {
+        let mut v = [0.0f32; 1];
+        simd_leak_integrate(&mut v, &[1.0], &[f32::NAN], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds 2^24")]
+    fn simd_refuses_tick_past_exact_f32() {
+        let mut v = [0.0f32; 1];
+        simd_leak_integrate(&mut v, &[1.0], &[1.0], (1 << 24) + 1);
+    }
+
+    #[test]
+    fn simd_accepts_tick_at_exact_f32_boundary() {
+        let mut v = [0.0f32; 1];
+        simd_leak_integrate(&mut v, &[1.0], &[1.0], 1 << 24);
+        assert!(v[0].is_finite());
     }
 }

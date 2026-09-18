@@ -1,0 +1,89 @@
+name: Release
+
+# Tag-triggered publish. Keeps crates.io, the annotated tag, and the GitHub
+# Release notes (from CHANGELOG) in lockstep — prior cuts tagged without ever
+# creating a GitHub Release object.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'cargo publish --dry-run only'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: verify + publish
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [[ "$TAG" != "$VERSION" ]]; then
+              echo "error: tag v$TAG does not match Cargo.toml $VERSION" >&2
+              exit 1
+            fi
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Release readiness (version triad + package denylist)
+        run: |
+          chmod +x scripts/check_release_ready.sh
+          ./scripts/check_release_ready.sh
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "error: CARGO_REGISTRY_TOKEN secret is not set" >&2
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            cargo publish --locked --dry-run
+          else
+            cargo publish --locked
+          fi
+
+      - name: Create GitHub Release from CHANGELOG
+        if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          BODY_FILE="$(mktemp)"
+          VERSION="$VERSION" python3 - <<'PY' >"$BODY_FILE"
+          import os, pathlib, re, sys
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          version = os.environ["VERSION"]
+          pat = rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)"
+          m = re.search(pat, text, re.S)
+          if not m:
+              sys.exit(f"CHANGELOG section for {version} not found")
+          print(m.group(1).strip())
+          PY
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists; leaving it"
+          else
+            gh release create "$TAG" --title "sparsl ${VERSION}" --notes-file "$BODY_FILE"
+          fi

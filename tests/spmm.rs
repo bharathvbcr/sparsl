@@ -43,7 +43,12 @@ fn exact_single_edge_fixture(nrows: usize, ncols: usize) -> (Csr, Vec<f32>) {
     let weights = (0..nrows)
         .map(|r| [0.5f32, -0.25, 1.0, -2.0][r % 4])
         .collect();
-    (Csr::from_adjacency(&adjacency), weights)
+    let built = Csr::from_adjacency(&adjacency);
+    (
+        Csr::from_parts(built.row_ptr().to_vec(), built.col().to_vec(), ncols)
+            .expect("exact fixture ncols"),
+        weights,
+    )
 }
 
 fn exact_batch_input(ncols: usize, n_vec: usize) -> Vec<f32> {
@@ -142,10 +147,10 @@ fn spmm_matches_a_dense_reference() {
 
     let mut want = vec![0.0f32; nrows * n_vec];
     for r in 0..nrows {
-        let (s, e) = (csr.row_ptr[r] as usize, csr.row_ptr[r + 1] as usize);
+        let (s, e) = (csr.row_ptr()[r] as usize, csr.row_ptr()[r + 1] as usize);
         for i in s..e {
             for (v, vec) in vectors.iter().enumerate() {
-                want[r * n_vec + v] += weights[i] * vec[csr.col[i] as usize];
+                want[r * n_vec + v] += weights[i] * vec[csr.col()[i] as usize];
             }
         }
     }
@@ -255,7 +260,7 @@ fn spmm_crosses_threadgroup_width_and_row_tail_boundaries_exactly() {
                     .expect("SpMM width above one threadgroup must split, not fail");
 
                 for (r, &weight) in weights.iter().enumerate() {
-                    let col = csr.col[csr.row_ptr[r] as usize] as usize;
+                    let col = csr.col()[csr.row_ptr()[r] as usize] as usize;
                     for v in 0..n_vec {
                         let i = r * n_vec + v;
                         let want = seed[i] + weight * x[col * n_vec + v];
@@ -309,7 +314,7 @@ fn spmm_reports_dimension_overflow_truthfully_without_mutating_output() {
     let device = Device::cpu_sequential();
 
     let input_overflow = device
-        .prepare(&Csr::from_adjacency(&[Vec::<u32>::new()]), 2, &[])
+        .prepare(&Csr::empty(1, 2), 2, &[])
         .expect("one empty row over two columns");
     let mut y = [17.0f32];
     let y_before = y;
@@ -334,7 +339,7 @@ fn spmm_reports_dimension_overflow_truthfully_without_mutating_output() {
     assert_eq!(y, y_before, "input-size refusal mutated the output");
 
     let output_overflow = device
-        .prepare(&Csr::empty(2), 0, &[])
+        .prepare(&Csr::empty(2, 0), 0, &[])
         .expect("two empty rows over zero columns");
     let mut y = [23.0f32];
     let y_before = y;
@@ -369,5 +374,20 @@ fn metal_spmm_uses_wide_address_arithmetic_for_large_batches() {
     assert!(
         source.contains("const ulong out_idx = (ulong)row * n_vec + v"),
         "SpMM output addressing must widen before multiplying"
+    );
+}
+
+/// The team SpMM tile loop reads `SIMD_SPMM_TILE` entries from `x` even on the
+/// final partial tile. Without the `v0 + t < n_vec` ternary those loads walk
+/// past the batch operand; Metal page-rounds the buffer so a black-box canary
+/// cannot catch the removal. Pin the guard the same way fused index widening
+/// is pinned in `tests/stress.rs`.
+#[test]
+fn metal_spmm_tile_loop_guards_partial_tail_reads() {
+    let source = include_str!("../src/kernels/spmv.metal");
+    assert!(
+        source.contains("const float xv = (v0 + t < (ulong)n_vec) ? x[base + t] : 0.0f;"),
+        "SpMM team tile loop must guard partial-tail x reads with v0+t < n_vec; \
+         an unguarded load is silent under Metal page rounding"
     );
 }

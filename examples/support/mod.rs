@@ -199,8 +199,8 @@ pub fn reference_spmv(
 
     let mut output = initial.to_vec();
     for (row, value) in output.iter_mut().enumerate() {
-        let start = csr.row_ptr[row] as usize;
-        let end = csr.row_ptr[row + 1] as usize;
+        let start = csr.row_ptr()[row] as usize;
+        let end = csr.row_ptr()[row + 1] as usize;
         // Accumulate the row from zero and fold the seed in once, rather than
         // accumulating into the seeded output. Both the CPU arm (`row_dot`,
         // then `*y += sum`) and every Metal SpMV kernel (`float sum = 0.0f`,
@@ -218,10 +218,10 @@ pub fn reference_spmv(
                 weights.len()
             )
         })?;
-        let row_cols = csr.col.get(start..end).ok_or_else(|| {
+        let row_cols = csr.col().get(start..end).ok_or_else(|| {
             format!(
                 "CSR row {row} addresses column range {start}..{end}, column length is {}",
-                csr.col.len()
+                csr.col().len()
             )
         })?;
         for (offset, (&weight, &col)) in row_weights.iter().zip(row_cols).enumerate() {
@@ -243,7 +243,7 @@ pub fn reference_spmv(
 /// Longest row, rather than the misleading mean degree, for error bounds.
 #[allow(dead_code)] // This shared module is compiled separately by non-SpMV examples.
 pub fn max_row_nnz(csr: &sparsl::Csr) -> usize {
-    csr.row_ptr
+    csr.row_ptr()
         .windows(2)
         .map(|bounds| (bounds[1] - bounds[0]) as usize)
         .max()
