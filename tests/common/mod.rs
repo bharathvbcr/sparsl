@@ -25,12 +25,8 @@ pub fn random_csr(nrows: usize, ncols: usize, max_deg: usize, rng: &mut Rng) -> 
         adj.push(row);
     }
     let built = Csr::from_adjacency(&adj);
-    Csr::from_parts(
-        built.row_ptr().to_vec(),
-        built.col().to_vec(),
-        ncols,
-    )
-    .expect("random_csr adjacency must be valid for the declared ncols")
+    Csr::from_parts(built.row_ptr().to_vec(), built.col().to_vec(), ncols)
+        .expect("random_csr adjacency must be valid for the declared ncols")
 }
 
 /// Uniform values in `[-scale, scale)`.

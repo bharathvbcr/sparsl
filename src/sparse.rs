@@ -371,16 +371,18 @@ impl Csc {
             }
             degrees[col] = degrees[col]
                 .checked_add(1)
-                .ok_or(CsrError::OffsetOverflow { what: "column degree" })?;
+                .ok_or(CsrError::OffsetOverflow {
+                    what: "column degree",
+                })?;
         }
 
         let mut col_ptr = Vec::with_capacity(ncols + 1);
         col_ptr.push(0);
         let mut acc = 0u32;
         for &d in &degrees {
-            acc = acc
-                .checked_add(d)
-                .ok_or(CsrError::OffsetOverflow { what: "column pointer" })?;
+            acc = acc.checked_add(d).ok_or(CsrError::OffsetOverflow {
+                what: "column pointer",
+            })?;
             col_ptr.push(acc);
         }
 
@@ -390,19 +392,17 @@ impl Csc {
         for r in 0..csr.nrows() {
             let start = csr.row_ptr()[r] as usize;
             let end = csr.row_ptr()[r + 1] as usize;
-            let row_u32 = u32::try_from(r).map_err(|_| CsrError::OffsetOverflow {
-                what: "row index",
-            })?;
+            let row_u32 =
+                u32::try_from(r).map_err(|_| CsrError::OffsetOverflow { what: "row index" })?;
             for e in start..end {
                 let c = csr.col()[e] as usize;
                 let slot = next[c] as usize;
                 row[slot] = row_u32;
-                edge_idx[slot] = u32::try_from(e).map_err(|_| CsrError::OffsetOverflow {
-                    what: "edge index",
+                edge_idx[slot] = u32::try_from(e)
+                    .map_err(|_| CsrError::OffsetOverflow { what: "edge index" })?;
+                next[c] = next[c].checked_add(1).ok_or(CsrError::OffsetOverflow {
+                    what: "column cursor",
                 })?;
-                next[c] = next[c]
-                    .checked_add(1)
-                    .ok_or(CsrError::OffsetOverflow { what: "column cursor" })?;
             }
         }
 

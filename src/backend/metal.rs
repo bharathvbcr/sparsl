@@ -1691,7 +1691,10 @@ impl MetalSparse {
     /// Length must be at least `ncols` f32 elements and the buffer's device
     /// `registryID` must match this operator. CSR/weights stay on the prepared
     /// resident path. Pair with [`Self::unbind_mtl_x`] to restore owned scratch.
-    pub fn bind_mtl_x(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) -> Result<(), OpError> {
+    pub fn bind_mtl_x(
+        &self,
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ) -> Result<(), OpError> {
         self.validate_external_vec(&buffer, self.shape.ncols, "external x")?;
         let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
             reason: "sparsl scratch mutex is poisoned",
@@ -1702,7 +1705,10 @@ impl MetalSparse {
     }
 
     /// Bind a caller-owned `MTLBuffer` as the SpMV `y` operand (no host copy).
-    pub fn bind_mtl_y(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) -> Result<(), OpError> {
+    pub fn bind_mtl_y(
+        &self,
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ) -> Result<(), OpError> {
         self.validate_external_vec(&buffer, self.shape.nrows, "external y")?;
         let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
             reason: "sparsl scratch mutex is poisoned",
@@ -1750,7 +1756,10 @@ impl MetalSparse {
     ///
     /// Useful for filling an operand that will be bound via [`Self::bind_mtl_x`]
     /// / [`Self::bind_mtl_y`] without a tessl dependency.
-    pub fn alloc_mtl_f32(&self, data: &[f32]) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, OpError> {
+    pub fn alloc_mtl_f32(
+        &self,
+        data: &[f32],
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, OpError> {
         ensure_device_healthy()?;
         let buf = self
             .device
@@ -2137,7 +2146,9 @@ impl MetalSparse {
         let max_tg = self
             .device
             .threadgroup_for(&self.device.tier(RowKernel::Scalar).spmm);
-        let cb = self.device.command_buffer("SpMM: Metal returned no command buffer")?;
+        let cb = self
+            .device
+            .command_buffer("SpMM: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "SpMM: Metal returned no compute encoder",
         })?;
@@ -2504,7 +2515,8 @@ fn refresh_hybrid_side(
         packed.extend_from_slice(&weights[s..e]);
     }
     write_from(&side.values, &packed);
-    if let (Some(buffer), Some(bits)) = (side.values_narrow.as_ref(), precision.narrow_bits(&packed))
+    if let (Some(buffer), Some(bits)) =
+        (side.values_narrow.as_ref(), precision.narrow_bits(&packed))
     {
         write_from(buffer, &bits);
     }
@@ -3593,11 +3605,7 @@ mod tests {
 
         // A non-terminal retained CB must keep quarantine and refuse reset.
         let device = shared_device().expect("device after first reset");
-        let queue = device
-            .queue
-            .lock()
-            .expect("queue mutex")
-            .clone();
+        let queue = device.queue.lock().expect("queue mutex").clone();
         let stuck = command_buffer(&queue, "non-terminal reset fixture")
             .expect("allocate uncommitted command buffer");
         assert_eq!(
@@ -3631,7 +3639,9 @@ mod tests {
 
         // Active admission blocks reset even with no timed-out CB.
         METAL_ADMISSION.clear_quarantine();
-        let _permit = METAL_ADMISSION.try_admit().expect("admit for reset refusal");
+        let _permit = METAL_ADMISSION
+            .try_admit()
+            .expect("admit for reset refusal");
         assert_eq!(
             reset_runtime(),
             Err(MetalResetError::ActiveAdmissions { count: 1 })
@@ -3639,8 +3649,8 @@ mod tests {
         drop(_permit);
 
         // Terminal retained CB: reset clears and admits again.
-        let terminal = command_buffer(&queue, "terminal reset fixture")
-            .expect("allocate command buffer");
+        let terminal =
+            command_buffer(&queue, "terminal reset fixture").expect("allocate command buffer");
         // Never committed: still NotEnqueued. Record it, then remove after we
         // have exercised the non-terminal path above. For the success path,
         // push nothing — empty timed-out list is the common recovery case.
@@ -4272,12 +4282,8 @@ mod tests {
                     })
                     .collect();
                 let built = Csr::from_adjacency(&adjacency);
-                let csr = Csr::from_parts(
-                    built.row_ptr().to_vec(),
-                    built.col().to_vec(),
-                    ncols,
-                )
-                .expect("tier-sweep fixture ncols");
+                let csr = Csr::from_parts(built.row_ptr().to_vec(), built.col().to_vec(), ncols)
+                    .expect("tier-sweep fixture ncols");
                 let weights: Vec<f32> = (0..csr.nnz()).map(|_| rng.next_f32() - 0.5).collect();
                 let x: Vec<f32> = (0..ncols).map(|_| rng.next_f32() - 0.5).collect();
                 let seed: Vec<f32> = (0..nrows).map(|_| rng.next_f32() - 0.5).collect();
@@ -4538,11 +4544,9 @@ mod tests {
         let mut v_c = v_m.clone();
         let mut th_c = th_m.clone();
         let mut sp_c = sp_m.clone();
-        op_m
-            .fused_spmv_lif(&x, &mut v_m, &mut th_m, &mut sp_m, params)
+        op_m.fused_spmv_lif(&x, &mut v_m, &mut th_m, &mut sp_m, params)
             .expect("metal fused");
-        op_c
-            .fused_spmv_lif(&x, &mut v_c, &mut th_c, &mut sp_c, params)
+        op_c.fused_spmv_lif(&x, &mut v_c, &mut th_c, &mut sp_c, params)
             .expect("cpu fused");
         for (i, (a, b)) in v_m.iter().zip(v_c.iter()).enumerate() {
             assert!(

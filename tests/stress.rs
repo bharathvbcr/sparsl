@@ -173,11 +173,7 @@ fn from_parts_and_prepare_agree_on_valid_shapes() {
         let nrows = rng.gen_index(32);
         let ncols = 1 + rng.gen_index(32);
         let csr = random_csr(nrows, ncols, 6, &mut rng);
-        let from_parts = Csr::from_parts(
-            csr.row_ptr().to_vec(),
-            csr.col().to_vec(),
-            csr.ncols(),
-        );
+        let from_parts = Csr::from_parts(csr.row_ptr().to_vec(), csr.col().to_vec(), csr.ncols());
         let prepared = device.prepare(&csr, csr.ncols(), &vec![1.0f32; csr.nnz()]);
         assert_eq!(
             from_parts.is_ok(),

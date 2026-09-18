@@ -1946,9 +1946,7 @@ fn validate_csr(csr: &Csr, ncols: usize) -> Result<SparseShape, SparsePlanError>
         return Err(SparsePlanError::EmptyRowPtr);
     }
     if row_ptr[0] != 0 {
-        return Err(SparsePlanError::NonZeroStart {
-            start: row_ptr[0],
-        });
+        return Err(SparsePlanError::NonZeroStart { start: row_ptr[0] });
     }
     for i in 1..row_ptr.len() {
         if row_ptr[i] < row_ptr[i - 1] {
@@ -2491,7 +2489,11 @@ mod nnz_balance_tests {
         let workers = 8usize;
         let parts = nnz_balanced_partitions(&row_ptr, workers);
         assert_eq!(parts.len(), workers.min(row_ptr.len() - 1));
-        assert_eq!(parts.first().copied(), Some((0, 1)), "hub row is its own first part");
+        assert_eq!(
+            parts.first().copied(),
+            Some((0, 1)),
+            "hub row is its own first part"
+        );
         let leaf_nnz: Vec<usize> = parts[1..]
             .iter()
             .map(|&(s, e)| (row_ptr[e] - row_ptr[s]) as usize)
@@ -2529,9 +2531,7 @@ mod nnz_balance_tests {
         cpu_spmv_parallel(&csr, &weights, &x, &mut y);
         let tasks = CPU_PARTITION_TASKS.load(Ordering::Relaxed);
         let workers = rayon::current_num_threads().max(1);
-        let max_parts = workers
-            .saturating_mul(PARALLEL_PARTS_PER_WORKER)
-            .min(nrows);
+        let max_parts = workers.saturating_mul(PARALLEL_PARTS_PER_WORKER).min(nrows);
         assert!(
             tasks > 1 && tasks <= max_parts && tasks < nrows,
             "expected nnz-balanced oversubscribe (<= {max_parts}), got {tasks} (nrows={nrows}, workers={workers})"
