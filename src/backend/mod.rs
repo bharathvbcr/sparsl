@@ -1800,7 +1800,7 @@ impl SparseOp {
 
     /// Bind a caller-owned `MTLBuffer` as SpMV `x` (Metal only; no host copy).
     ///
-    /// See [`crate::backend::metal`] module docs for the SharedEvent handoff
+    /// See the Metal backend module docs for the SharedEvent handoff
     /// pattern with tessl. Length must cover `ncols` f32s; device `registryID`
     /// must match. CSR/weights stay on the prepared resident path.
     #[cfg(all(target_os = "macos", feature = "metal"))]

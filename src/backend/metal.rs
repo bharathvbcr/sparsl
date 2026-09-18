@@ -1675,7 +1675,7 @@ impl MetalSparse {
                 lhs: elems,
                 rhs: std::mem::size_of::<f32>(),
             })?;
-        let got = buffer.length() as usize;
+        let got = buffer.length();
         if got < need {
             return Err(OpError::TooShort {
                 what,
