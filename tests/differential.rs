@@ -290,12 +290,12 @@ fn parse_proptest_cases(raw: Option<&str>) -> Result<u32, &'static str> {
 }
 
 fn persisted_proptest_config(cases: u32) -> ProptestConfig {
-    // `SourceParallel`, proptest's default, searches for `lib.rs` or
-    // `main.rs` directly beside an ancestor of this integration-test source.
-    // Cargo crates put that file under `src/`, so the search fails here and a
-    // minimized GPU failure is not persisted. Use a stable crate-relative
-    // destination so soak failures remain replayable instead of disappearing
-    // with their random seed.
+    // `SourceParallel`, proptest's default, searches the ancestors of this
+    // integration-test source for `lib.rs` or `main.rs`. None of them is inside
+    // the package, so proptest 1.6 warns and falls back to this same path next
+    // to the test, or writes outside the package if a directory above it has
+    // one (proptest #233). `Direct` pins the corpus here regardless, so soak
+    // failures stay replayable.
     ProptestConfig {
         cases,
         failure_persistence: Some(Box::new(FileFailurePersistence::Direct(FAILURE_CORPUS))),
