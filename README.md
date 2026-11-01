@@ -18,10 +18,11 @@
   <a href="https://docs.rs/sparsl"><strong>API documentation</strong></a> ·
   <a href="https://crates.io/crates/sparsl"><strong>crates.io</strong></a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
-  <a href="https://github.com/bharathvbcr/tessl">tessl, the dense counterpart</a>
+  <a href="https://github.com/bharathvbcr/ojas">ojas, universal framework</a> ·
+  <a href="https://github.com/bharathvbcr/tessl">tessl, dense Metal counterpart</a>
 </p>
 
-Deterministic sparse and scan compute kernels for event-driven simulation, with fail-closed CPU and GPU backends.
+Deterministic sparse and scan compute kernels for event-driven simulation, serving as the **dedicated Sparse Computing extension of [ojas](https://github.com/bharathvbcr/ojas)** with fail-closed CPU and GPU backends.
 
 Extracted from the numeric core of a spiking-network research harness. The kernels themselves are small and unglamorous — CSR sparse matrix-vector multiply, a leaky integrate-and-fire membrane update, a chunked prefix scan over affine maps, structure-of-arrays column buffers, a seeded RNG. What the crate is about is the two properties those kernels are held to: **results you can reproduce bit for bit**, and **a backend handle that cannot lie about where it ran**.
 
@@ -85,6 +86,22 @@ flowchart LR
 | `scan` | Chunked prefix scan over affine maps, bit-exact against sequential |
 | `simd` | Lane-shaped leak/integrate, no intrinsics, no `unsafe` |
 | `buffer`, `rng`, `time` | SoA columns, seeded ChaCha, tick type |
+
+---
+
+### Modular Role in the ojas Ecosystem & Modularity Rationale
+
+`sparsl` is the **dedicated Sparse Computing extension of [ojas](https://github.com/bharathvbcr/ojas)**, serving as the sparse counterpart to [tessl](https://github.com/bharathvbcr/tessl) (dense Metal 4 acceleration).
+
+Within the broader neural and scientific computing ecosystem:
+- **Neural Interop:** Provides sparse gradient masks, dynamic sparse recompute maps, and event-driven gating (`st-gate`) for sparse neural architectures and spiking networks.
+- **Fail-Closed Governance:** Honors ojas's core guarantee that hardware cannot silently degrade or substitute CPU execution without the caller's explicit knowledge.
+
+**The Modularity Rationale (Why a Dedicated Extension):**
+1. **Decoupled Compile Cycles:** Sparse computing logic, prefix scans, and extensive property-based mutation campaigns (`proptest`) remain isolated from universal neural network autograd, dense GEMM, and model training dependencies.
+2. **Isolated Hardware Requirements:** Runs portably on any CPU (x86_64, aarch64) with optional Apple Silicon Metal compute without requiring CUDA/wgpu or dense tensor runtime frameworks.
+3. **Independent Profiling:** Micro-benchmarking crossover thresholds (where sparse CSR representations outperform dense GEMMs across matrix dimensions and density percentages) requires specialized crossover benchmark suites (`scan_crossover`, `spike_crossover`, `narrow_crossover`).
+4. **Clean Separation of Concerns:** Downstream event-driven simulations can import `sparsl` directly without dragging in dense autograd, optimizer matrices, or large model runtime graphs.
 
 ---
 
