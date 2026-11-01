@@ -1,10 +1,85 @@
+# Build targets (Cargo)
+target/
 /target
+/target/
+/target-*/
+target-*/
+**/target/
 **/*.rs.bk
 *.pdb
 
 # devmap's code-index cache. Regenerated on demand; must never enter a .crate
 # (cargo package --allow-dirty previously would have shipped ~7MB of sqlite).
 .devmap/
+/.devmap/
 
-.DS_Store
+# Python artifacts & virtual environments
 __pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+.venv/
+venv/
+env/
+
+# Secrets & environment configurations
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# OS metadata
+.DS_Store
+**/.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Editor & IDE configurations
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# Local development, agents & tooling caches
+.agents/
+.gemini/
+.devcouncil/
+.gitpulse/
+.claude-account
+
+# Claude Code: keep tracked settings.json, ignore runtime & worktrees
+!.claude/
+.claude/*
+!.claude/settings.json
+
+# Agent session, build and wave reports
+BUILD_REPORT*
+/BUILD_REPORT*
+WAVE_REPORT*
+/WAVE_REPORT*
+*wave*report*
+*build*report*
+BRANCH_REPORT*
+/BRANCH_REPORT*
+AUDIT_REPORT*
+/AUDIT_REPORT*
+
+# Local scratch & temporary files
+scratch/
+/scratch/
+tmp/
+/tmp/
+*.tmp
+*.log
