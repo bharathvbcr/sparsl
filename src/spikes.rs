@@ -45,13 +45,57 @@ pub const fn packed_len(n: usize) -> usize {
 
 /// Pack a boolean spike vector, least-significant bit first.
 pub fn pack_spikes(spikes: &[bool]) -> Vec<u32> {
-    let mut out = vec![0u32; packed_len(spikes.len())];
-    for (i, &fired) in spikes.iter().enumerate() {
-        if fired {
-            out[i / SPIKES_PER_WORD] |= 1u32 << (i % SPIKES_PER_WORD);
+    let mut out = Vec::with_capacity(packed_len(spikes.len()));
+    let chunks = spikes.chunks_exact(SPIKES_PER_WORD);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        let mut word = 0u32;
+        for (bit, &fired) in chunk.iter().enumerate() {
+            word |= (fired as u32) << bit;
         }
+        out.push(word);
+    }
+    if !remainder.is_empty() {
+        let mut word = 0u32;
+        for (bit, &fired) in remainder.iter().enumerate() {
+            word |= (fired as u32) << bit;
+        }
+        out.push(word);
     }
     out
+}
+
+/// Pack a boolean spike vector into an existing word slice, zeroing unused tail bits.
+///
+/// # Panics
+///
+/// If `out.len() < packed_len(spikes.len())`.
+pub fn pack_spikes_into(spikes: &[bool], out: &mut [u32]) {
+    let need = packed_len(spikes.len());
+    assert!(
+        out.len() >= need,
+        "sparsl: {} words cannot hold {} packed spikes",
+        out.len(),
+        spikes.len()
+    );
+    let chunks = spikes.chunks_exact(SPIKES_PER_WORD);
+    let remainder = chunks.remainder();
+    let full = chunks.len();
+    for (dst, chunk) in out[..full].iter_mut().zip(chunks) {
+        let mut word = 0u32;
+        for (bit, &fired) in chunk.iter().enumerate() {
+            word |= (fired as u32) << bit;
+        }
+        *dst = word;
+    }
+    if !remainder.is_empty() {
+        let mut word = 0u32;
+        for (bit, &fired) in remainder.iter().enumerate() {
+            word |= (fired as u32) << bit;
+        }
+        out[full] = word;
+    }
+    out[need..].fill(0);
 }
 
 /// Unpack `n` spikes from `words`.
@@ -67,9 +111,24 @@ pub fn unpack_spikes(words: &[u32], n: usize) -> Vec<bool> {
         "sparsl: {} words cannot hold {n} spikes",
         words.len()
     );
-    (0..n)
-        .map(|i| (words[i / SPIKES_PER_WORD] >> (i % SPIKES_PER_WORD)) & 1 == 1)
-        .collect()
+    let mut out = vec![false; n];
+    let full_words = n / SPIKES_PER_WORD;
+    for (chunk, &word) in out[..full_words * SPIKES_PER_WORD]
+        .chunks_exact_mut(SPIKES_PER_WORD)
+        .zip(&words[..full_words])
+    {
+        for (bit, dst) in chunk.iter_mut().enumerate() {
+            *dst = ((word >> bit) & 1) == 1;
+        }
+    }
+    let rem_base = full_words * SPIKES_PER_WORD;
+    if rem_base < n {
+        let word = words[full_words];
+        for (bit, dst) in out[rem_base..].iter_mut().enumerate() {
+            *dst = ((word >> bit) & 1) == 1;
+        }
+    }
+    out
 }
 
 /// The dense `f32` vector a packed spike train stands in for.
@@ -137,5 +196,23 @@ mod tests {
     fn the_dense_form_is_exactly_zero_and_one() {
         let packed = pack_spikes(&[true, false, true, true]);
         assert_eq!(spikes_to_f32(&packed, 4), vec![1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn pack_spikes_into_reuses_buffer_and_zeros_stale_tail_words() {
+        let mut buf = vec![u32::MAX; 8];
+        for n in [0usize, 1, 31, 32, 33, 63, 64, 65, 199] {
+            let mut rng = Rng::new(0x9AC4_0000 + n as u64);
+            let spikes: Vec<bool> = (0..n).map(|_| rng.next_f32() < 0.37).collect();
+            buf.fill(u32::MAX);
+            pack_spikes_into(&spikes, &mut buf);
+            let expected = pack_spikes(&spikes);
+            let words = packed_len(n);
+            assert_eq!(&buf[..words], expected.as_slice(), "mismatch at n={n}");
+            assert!(
+                buf[words..].iter().all(|&w| w == 0),
+                "stale tail words above packed_len({n}) must be zeroed"
+            );
+        }
     }
 }

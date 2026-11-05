@@ -1254,6 +1254,7 @@ enum OpResident {
 /// CPU-side resident operands for the write / step / sync API.
 struct CpuScratch {
     x: Vec<f32>,
+    x_spikes: Vec<u32>,
     y: Vec<f32>,
     v: Vec<f32>,
     theta: Vec<f32>,
@@ -1264,6 +1265,7 @@ impl CpuScratch {
     fn new(shape: SparseShape) -> Self {
         Self {
             x: vec![0.0; shape.ncols()],
+            x_spikes: vec![0u32; crate::spikes::packed_len(shape.ncols())],
             y: vec![0.0; shape.nrows()],
             v: vec![0.0; shape.nrows()],
             theta: vec![0.0; shape.nrows()],
@@ -1633,6 +1635,48 @@ impl SparseOp {
         }
     }
 
+    /// Fused `current = A · s` + LIF membrane update for a bitpacked spike
+    /// vector (`32x` smaller `x` working set than `f32`).
+    ///
+    /// Bit-identical to [`SparseOp::fused_spmv_lif`] called with
+    /// [`crate::spikes::spikes_to_f32`] on the same backend (both CPU and
+    /// Metal, uniform and degree-skewed hybrid).
+    pub fn fused_spmv_spikes_lif(
+        &self,
+        spikes_in: &[u32],
+        v: &mut [f32],
+        theta: &mut [f32],
+        spikes_out: &mut [bool],
+        params: LifParams,
+    ) -> Result<(), OpError> {
+        let words = crate::spikes::packed_len(self.shape.ncols());
+        require_min_len("spikes_in", spikes_in.len(), words)?;
+        require_len("v", v.len(), self.shape.nrows())?;
+        require_len("theta", theta.len(), self.shape.nrows())?;
+        require_len("spikes_out", spikes_out.len(), self.shape.nrows())?;
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu { csr, weights, .. } => {
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_fused_spikes_parallel(
+                        csr, weights, spikes_in, v, theta, spikes_out, params,
+                    );
+                } else {
+                    cpu_fused_spikes_sequential(
+                        csr, weights, spikes_in, v, theta, spikes_out, params,
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => {
+                op.fused_spmv_spikes_lif(spikes_in, v, theta, spikes_out, params)
+            }
+        }
+    }
+
     /// Upload `x` into resident scratch without dispatching.
     ///
     /// Pair with [`SparseOp::spmv_resident`] / [`SparseOp::fused_spmv_lif_resident`]
@@ -1650,6 +1694,23 @@ impl SparseOp {
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             OpResident::Metal(op) => op.write_x(x),
+        }
+    }
+
+    /// Upload bitpacked spikes into resident `x_spikes` scratch without dispatching.
+    pub fn write_x_spikes(&self, spikes: &[u32]) -> Result<(), OpError> {
+        let words = crate::spikes::packed_len(self.shape.ncols());
+        require_min_len("spikes", spikes.len(), words)?;
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                s.x_spikes[..words].copy_from_slice(&spikes[..words]);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.write_x_spikes(spikes),
         }
     }
 
@@ -1754,6 +1815,119 @@ impl SparseOp {
             }
             #[cfg(all(target_os = "macos", feature = "metal"))]
             OpResident::Metal(op) => op.fused_spmv_lif_resident(params),
+        }
+    }
+
+    /// Fused bitpacked-spike SpMV+LIF on resident `x_spikes`/`v`/`theta`/`spikes`
+    /// scratch; no host readback.
+    pub fn fused_spmv_spikes_lif_resident(&self, params: LifParams) -> Result<(), OpError> {
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu {
+                csr,
+                weights,
+                scratch,
+                ..
+            } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                let CpuScratch {
+                    x_spikes: ref xs_res,
+                    v: ref mut v_res,
+                    theta: ref mut th_res,
+                    spikes: ref mut sp_res,
+                    ..
+                } = &mut *s;
+                if self.device.backend == Backend::CpuParallel {
+                    cpu_fused_spikes_parallel(csr, weights, xs_res, v_res, th_res, sp_res, params);
+                } else {
+                    cpu_fused_spikes_sequential(
+                        csr, weights, xs_res, v_res, th_res, sp_res, params,
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.fused_spmv_spikes_lif_resident(params),
+        }
+    }
+
+    /// Pack resident output `spikes` into resident `x_spikes` without host
+    /// readback or heap allocation (square recurrent operators: `nrows == ncols`).
+    pub fn pack_resident_spikes_to_x_spikes(&self) -> Result<(), OpError> {
+        require_len("recurrent nrows", self.shape.nrows(), self.shape.ncols())?;
+        if self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu { scratch, .. } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                let CpuScratch {
+                    spikes: ref sp_res,
+                    x_spikes: ref mut xs_res,
+                    ..
+                } = &mut *s;
+                crate::spikes::pack_spikes_into(sp_res, xs_res);
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.pack_resident_spikes_to_x_spikes(),
+        }
+    }
+
+    /// Execute `steps` recurrent ticks (`fused_spmv_spikes_lif` -> `pack_spikes`
+    /// into `x_spikes`) on resident scratch without host copies.
+    ///
+    /// On Metal, up to 256 recurrent ticks are fused into a single serial
+    /// `MTLComputeCommandEncoder` and a single `MTLCommandBuffer`. Requires a
+    /// square operator (`nrows == ncols`).
+    pub fn fused_spmv_spikes_lif_recurrent_steps(
+        &self,
+        params: LifParams,
+        steps: usize,
+    ) -> Result<(), OpError> {
+        require_len("recurrent nrows", self.shape.nrows(), self.shape.ncols())?;
+        if steps == 0 || self.shape.nrows() == 0 {
+            return Ok(());
+        }
+        match &self.resident {
+            OpResident::Cpu {
+                csr,
+                weights,
+                scratch,
+                ..
+            } => {
+                let mut s = scratch.lock().map_err(|_| OpError::Backend {
+                    reason: "sparsl CPU scratch mutex is poisoned",
+                })?;
+                let CpuScratch {
+                    x_spikes: ref mut xs_res,
+                    v: ref mut v_res,
+                    theta: ref mut th_res,
+                    spikes: ref mut sp_res,
+                    ..
+                } = &mut *s;
+                for _ in 0..steps {
+                    if self.device.backend == Backend::CpuParallel {
+                        cpu_fused_spikes_parallel(
+                            csr, weights, xs_res, v_res, th_res, sp_res, params,
+                        );
+                    } else {
+                        cpu_fused_spikes_sequential(
+                            csr, weights, xs_res, v_res, th_res, sp_res, params,
+                        );
+                    }
+                    crate::spikes::pack_spikes_into(sp_res, xs_res);
+                }
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            OpResident::Metal(op) => op.fused_spmv_spikes_lif_recurrent_steps(params, steps),
         }
     }
 
@@ -2368,6 +2542,75 @@ fn cpu_fused_parallel(
             lif_step(v_i, th_i, current, spk, p);
         }
     });
+}
+
+type PartitionMutSlices<'a> = Vec<(usize, &'a mut [f32], &'a mut [f32], &'a mut [bool])>;
+
+fn split_lif_partitions<'a>(
+    partitions: &[(usize, usize)],
+    mut v: &'a mut [f32],
+    mut theta: &'a mut [f32],
+    mut spikes: &'a mut [bool],
+) -> PartitionMutSlices<'a> {
+    let mut out = Vec::with_capacity(partitions.len());
+    let mut cursor = 0usize;
+    for &(start, end) in partitions {
+        debug_assert_eq!(start, cursor);
+        let len = end - start;
+        let (v_part, v_rest) = v.split_at_mut(len);
+        let (th_part, th_rest) = theta.split_at_mut(len);
+        let (sp_part, sp_rest) = spikes.split_at_mut(len);
+        out.push((start, v_part, th_part, sp_part));
+        v = v_rest;
+        theta = th_rest;
+        spikes = sp_rest;
+        cursor = end;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_fused_spikes_sequential(
+    csr: &Csr,
+    weights: &[f32],
+    spikes_in: &[u32],
+    v: &mut [f32],
+    theta: &mut [f32],
+    spikes_out: &mut [bool],
+    p: LifParams,
+) {
+    for r in 0..v.len() {
+        let current = row_dot_spikes(csr, weights, spikes_in, r);
+        lif_step(&mut v[r], &mut theta[r], current, &mut spikes_out[r], p);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_fused_spikes_parallel(
+    csr: &Csr,
+    weights: &[f32],
+    spikes_in: &[u32],
+    v: &mut [f32],
+    theta: &mut [f32],
+    spikes_out: &mut [bool],
+    p: LifParams,
+) {
+    use rayon::prelude::*;
+    let partitions = parallel_line_partitions(csr.row_ptr(), v.len());
+    let slices = split_lif_partitions(&partitions, v, theta, spikes_out);
+    slices
+        .into_par_iter()
+        .for_each(|(start, v_part, th_part, sp_part)| {
+            for ((offset, (v_i, th_i)), spk) in v_part
+                .iter_mut()
+                .zip(th_part.iter_mut())
+                .enumerate()
+                .zip(sp_part.iter_mut())
+            {
+                let current = row_dot_spikes(csr, weights, spikes_in, start + offset);
+                lif_step(v_i, th_i, current, spk, p);
+            }
+        });
 }
 
 #[cfg(test)]

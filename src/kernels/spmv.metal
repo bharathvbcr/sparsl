@@ -302,6 +302,195 @@ kernel void NAME(                                                              \
     }                                                                          \
 }
 
+/// Fused bitpacked-spike SpMV + LIF: gathers 1-bit spikes (`32x` smaller `x`
+/// working set) and commits the LIF membrane update in registers without
+/// materialising the intermediate `f32` current vector.
+#define FUSED_SPIKES_LIF_KERNEL(NAME, LPR)                                     \
+kernel void NAME(                                                              \
+    device const uint*  row_ptr     [[buffer(0)]],                             \
+    device const uint*  col_ind     [[buffer(1)]],                             \
+    device const float* values      [[buffer(2)]],                             \
+    device const uint*  x_spikes    [[buffer(3)]],                             \
+    device float*       v           [[buffer(4)]],                             \
+    device float*       theta       [[buffer(5)]],                             \
+    device uchar*       spikes      [[buffer(6)]],                             \
+    constant float&     decay       [[buffer(7)]],                             \
+    constant float&     v_reset     [[buffer(8)]],                             \
+    constant float&     delta_theta [[buffer(9)]],                             \
+    constant uint&      n_rows      [[buffer(10)]],                            \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong row = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (row >= (ulong)n_rows) { return; }                                      \
+    const uint lane = tid % LPR;                                               \
+    const float total_current = line_dot_spikes<LPR>(                          \
+        col_ind, values, x_spikes, row_ptr[row], row_ptr[row + 1], lane);      \
+    if (lane == 0u) {                                                          \
+        float voltage = v[row] * decay + total_current;                        \
+        float th = theta[row];                                                 \
+        if (voltage >= th) {                                                   \
+            spikes[row] = 1;                                                   \
+            v[row]      = v_reset;                                             \
+            theta[row]  = th + delta_theta;                                    \
+        } else {                                                               \
+            spikes[row] = 0;                                                   \
+            v[row]      = voltage;                                             \
+        }                                                                      \
+    }                                                                          \
+}
+
+/// Compact row-indexed `y[row_ids[idx]] += A_sub[idx] * x` for degree-skew
+/// hybrid splits: launches only `n_active` row teams instead of padded empty
+/// rows across the full `nrows` matrix.
+#define SPMV_INDEXED_KERNEL(NAME, LPR, VALUE_T)                                \
+kernel void NAME(                                                              \
+    device const uint*    row_ptr  [[buffer(0)]],                              \
+    device const uint*    col_ind  [[buffer(1)]],                              \
+    device const VALUE_T* values   [[buffer(2)]],                              \
+    device const float*   x        [[buffer(3)]],                              \
+    device float*         y        [[buffer(4)]],                              \
+    device const uint*    row_ids  [[buffer(5)]],                              \
+    constant uint&        n_active [[buffer(6)]],                              \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong idx = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (idx >= (ulong)n_active) { return; }                                    \
+    const uint lane = tid % LPR;                                               \
+    const float total = line_dot<LPR, VALUE_T>(                                \
+        col_ind, values, x, row_ptr[idx], row_ptr[idx + 1], lane);             \
+    if (lane == 0u) { y[row_ids[idx]] += total; }                              \
+}
+
+/// Compact row-indexed `y[row_ids[idx]] += A_sub[idx] * s` for bitpacked spikes.
+#define SPMV_SPIKES_INDEXED_KERNEL(NAME, LPR)                                  \
+kernel void NAME(                                                              \
+    device const uint*  row_ptr  [[buffer(0)]],                                \
+    device const uint*  col_ind  [[buffer(1)]],                                \
+    device const float* values   [[buffer(2)]],                                \
+    device const uint*  spikes   [[buffer(3)]],                                \
+    device float*       y        [[buffer(4)]],                                \
+    device const uint*  row_ids  [[buffer(5)]],                                \
+    constant uint&      n_active [[buffer(6)]],                                \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong idx = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (idx >= (ulong)n_active) { return; }                                    \
+    const uint lane = tid % LPR;                                               \
+    const float total = line_dot_spikes<LPR>(                                  \
+        col_ind, values, spikes, row_ptr[idx], row_ptr[idx + 1], lane);        \
+    if (lane == 0u) { y[row_ids[idx]] += total; }                              \
+}
+
+/// Compact column-indexed `y[col_ids[idx]] += (A^T)_sub[idx] * x`.
+#define SPMV_T_INDEXED_KERNEL(NAME, LPR)                                       \
+kernel void NAME(                                                              \
+    device const uint*  col_ptr  [[buffer(0)]],                                \
+    device const uint*  row_ind  [[buffer(1)]],                                \
+    device const uint*  edge_idx [[buffer(2)]],                                \
+    device const float* values   [[buffer(3)]],                                \
+    device const float* x        [[buffer(4)]],                                \
+    device float*       y        [[buffer(5)]],                                \
+    device const uint*  col_ids  [[buffer(6)]],                                \
+    constant uint&      n_active [[buffer(7)]],                                \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong idx = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (idx >= (ulong)n_active) { return; }                                    \
+    const uint lane = tid % LPR;                                               \
+    const float total = line_dot_t<LPR>(                                       \
+        row_ind, edge_idx, values, x, col_ptr[idx], col_ptr[idx + 1], lane);   \
+    if (lane == 0u) { y[col_ids[idx]] += total; }                              \
+}
+
+/// Compact row-indexed fused SpMV + LIF mega-kernel: enables degree-skewed
+/// hybrid operators (`long` + `short` disjoint partition of `0..nrows`) to
+/// execute in a SINGLE compute encoder and SINGLE command buffer without
+/// materialising or zeroing `y`.
+#define FUSED_LIF_INDEXED_KERNEL(NAME, LPR)                                    \
+kernel void NAME(                                                              \
+    device const uint*  row_ptr     [[buffer(0)]],                             \
+    device const uint*  col_ind     [[buffer(1)]],                             \
+    device const float* values      [[buffer(2)]],                             \
+    device const float* x           [[buffer(3)]],                             \
+    device float*       v           [[buffer(4)]],                             \
+    device float*       theta       [[buffer(5)]],                             \
+    device uchar*       spikes      [[buffer(6)]],                             \
+    device const uint*  row_ids     [[buffer(7)]],                             \
+    constant float&     decay       [[buffer(8)]],                             \
+    constant float&     v_reset     [[buffer(9)]],                             \
+    constant float&     delta_theta [[buffer(10)]],                            \
+    constant uint&      n_active    [[buffer(11)]],                            \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong idx = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (idx >= (ulong)n_active) { return; }                                    \
+    const uint lane = tid % LPR;                                               \
+    const float total_current = line_dot<LPR, float>(                          \
+        col_ind, values, x, row_ptr[idx], row_ptr[idx + 1], lane);             \
+    if (lane == 0u) {                                                          \
+        const uint row = row_ids[idx];                                         \
+        float voltage = v[row] * decay + total_current;                        \
+        float th = theta[row];                                                 \
+        if (voltage >= th) {                                                   \
+            spikes[row] = 1;                                                   \
+            v[row]      = v_reset;                                             \
+            theta[row]  = th + delta_theta;                                    \
+        } else {                                                               \
+            spikes[row] = 0;                                                   \
+            v[row]      = voltage;                                             \
+        }                                                                      \
+    }                                                                          \
+}
+
+/// Compact row-indexed fused bitpacked-spike SpMV + LIF mega-kernel.
+#define FUSED_SPIKES_LIF_INDEXED_KERNEL(NAME, LPR)                             \
+kernel void NAME(                                                              \
+    device const uint*  row_ptr     [[buffer(0)]],                             \
+    device const uint*  col_ind     [[buffer(1)]],                             \
+    device const float* values      [[buffer(2)]],                             \
+    device const uint*  x_spikes    [[buffer(3)]],                             \
+    device float*       v           [[buffer(4)]],                             \
+    device float*       theta       [[buffer(5)]],                             \
+    device uchar*       spikes      [[buffer(6)]],                             \
+    device const uint*  row_ids     [[buffer(7)]],                             \
+    constant float&     decay       [[buffer(8)]],                             \
+    constant float&     v_reset     [[buffer(9)]],                             \
+    constant float&     delta_theta [[buffer(10)]],                            \
+    constant uint&      n_active    [[buffer(11)]],                            \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong idx = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (idx >= (ulong)n_active) { return; }                                    \
+    const uint lane = tid % LPR;                                               \
+    const float total_current = line_dot_spikes<LPR>(                          \
+        col_ind, values, x_spikes, row_ptr[idx], row_ptr[idx + 1], lane);      \
+    if (lane == 0u) {                                                          \
+        const uint row = row_ids[idx];                                         \
+        float voltage = v[row] * decay + total_current;                        \
+        float th = theta[row];                                                 \
+        if (voltage >= th) {                                                   \
+            spikes[row] = 1;                                                   \
+            v[row]      = v_reset;                                             \
+            theta[row]  = th + delta_theta;                                    \
+        } else {                                                               \
+            spikes[row] = 0;                                                   \
+            v[row]      = voltage;                                             \
+        }                                                                      \
+    }                                                                          \
+}
+
 /// Vectors a lane keeps in registers per pass of the team SpMM kernels.
 ///
 /// The row's indices and weights are re-read once per tile, so a wider tile
@@ -379,6 +568,48 @@ kernel void NAME(                                                              \
     }                                                                          \
 }
 
+/// Compact row-indexed batched SpMM for degree-skew hybrid splits.
+#define SPMM_INDEXED_KERNEL(NAME, LPR)                                         \
+kernel void NAME(                                                              \
+    device const uint*  row_ptr  [[buffer(0)]],                                \
+    device const uint*  col_ind  [[buffer(1)]],                                \
+    device const float* values   [[buffer(2)]],                                \
+    device const float* x        [[buffer(3)]],                                \
+    device float*       y        [[buffer(4)]],                                \
+    device const uint*  row_ids  [[buffer(5)]],                                \
+    constant uint&      n_active [[buffer(6)]],                                \
+    constant uint&      n_vec    [[buffer(7)]],                                \
+    uint tid               [[thread_position_in_threadgroup]],                 \
+    uint group_id          [[threadgroup_position_in_grid]],                   \
+    uint threads_per_group [[threads_per_threadgroup]]                         \
+) {                                                                            \
+    const ulong idx = line_for<LPR>(group_id, threads_per_group, tid);         \
+    if (idx >= (ulong)n_active) { return; }                                    \
+    const uint lane = tid % LPR;                                               \
+    const uint row = row_ids[idx];                                             \
+    const uint row_start = row_ptr[idx];                                       \
+    const uint row_end   = row_ptr[idx + 1];                                   \
+    for (ulong v0 = 0ul; v0 < (ulong)n_vec; v0 += (ulong)SIMD_SPMM_TILE) {     \
+        float acc[SIMD_SPMM_TILE];                                             \
+        for (uint t = 0u; t < SIMD_SPMM_TILE; ++t) { acc[t] = 0.0f; }          \
+        for (ulong i = (ulong)row_start + lane; i < (ulong)row_end;            \
+             i += (ulong)LPR) {                                                \
+            const float w = values[i];                                         \
+            const ulong base = (ulong)col_ind[i] * n_vec + v0;                 \
+            for (uint t = 0u; t < SIMD_SPMM_TILE; ++t) {                       \
+                const float xv = (v0 + t < (ulong)n_vec) ? x[base + t] : 0.0f; \
+                acc[t] += w * xv;                                              \
+            }                                                                  \
+        }                                                                      \
+        for (uint t = 0u; t < SIMD_SPMM_TILE; ++t) {                           \
+            const float total = fold_lanes<LPR>(acc[t]);                       \
+            if (lane == 0u && v0 + t < (ulong)n_vec) {                         \
+                y[(ulong)row * (ulong)n_vec + v0 + t] += total;                \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+
 // One lane per line: the sequential loop with an empty fold.
 SPMV_KERNEL(csr_spmv_l1_kernel,       1u, float)
 SPMV_KERNEL(csr_spmv_f16_l1_kernel,   1u, half)
@@ -386,6 +617,14 @@ SPMV_KERNEL(csr_spmv_bf16_l1_kernel,  1u, bfloat)
 SPMV_SPIKES_KERNEL(csr_spmv_spikes_l1_kernel, 1u)
 SPMV_T_KERNEL(csc_spmv_t_l1_kernel, 1u)
 FUSED_LIF_KERNEL(fused_spmv_lif_l1_kernel, 1u)
+FUSED_SPIKES_LIF_KERNEL(fused_spmv_spikes_lif_l1_kernel, 1u)
+SPMV_INDEXED_KERNEL(csr_spmv_indexed_l1_kernel,      1u, float)
+SPMV_INDEXED_KERNEL(csr_spmv_f16_indexed_l1_kernel,  1u, half)
+SPMV_INDEXED_KERNEL(csr_spmv_bf16_indexed_l1_kernel, 1u, bfloat)
+SPMV_SPIKES_INDEXED_KERNEL(csr_spmv_spikes_indexed_l1_kernel, 1u)
+SPMV_T_INDEXED_KERNEL(csc_spmv_t_indexed_l1_kernel, 1u)
+FUSED_LIF_INDEXED_KERNEL(fused_spmv_lif_indexed_l1_kernel, 1u)
+FUSED_SPIKES_LIF_INDEXED_KERNEL(fused_spmv_spikes_lif_indexed_l1_kernel, 1u)
 
 // Eight lanes per line: four teams per simdgroup.
 SPMV_KERNEL(csr_spmv_l8_kernel,       8u, float)
@@ -394,7 +633,16 @@ SPMV_KERNEL(csr_spmv_bf16_l8_kernel,  8u, bfloat)
 SPMV_SPIKES_KERNEL(csr_spmv_spikes_l8_kernel, 8u)
 SPMV_T_KERNEL(csc_spmv_t_l8_kernel, 8u)
 FUSED_LIF_KERNEL(fused_spmv_lif_l8_kernel, 8u)
+FUSED_SPIKES_LIF_KERNEL(fused_spmv_spikes_lif_l8_kernel, 8u)
 SPMM_KERNEL(csr_spmm_l8_kernel, 8u)
+SPMV_INDEXED_KERNEL(csr_spmv_indexed_l8_kernel,      8u, float)
+SPMV_INDEXED_KERNEL(csr_spmv_f16_indexed_l8_kernel,  8u, half)
+SPMV_INDEXED_KERNEL(csr_spmv_bf16_indexed_l8_kernel, 8u, bfloat)
+SPMV_SPIKES_INDEXED_KERNEL(csr_spmv_spikes_indexed_l8_kernel, 8u)
+SPMV_T_INDEXED_KERNEL(csc_spmv_t_indexed_l8_kernel, 8u)
+FUSED_LIF_INDEXED_KERNEL(fused_spmv_lif_indexed_l8_kernel, 8u)
+FUSED_SPIKES_LIF_INDEXED_KERNEL(fused_spmv_spikes_lif_indexed_l8_kernel, 8u)
+SPMM_INDEXED_KERNEL(csr_spmm_indexed_l8_kernel, 8u)
 
 // A whole simdgroup per line.
 SPMV_KERNEL(csr_spmv_l32_kernel,      SIMD_LANES, float)
@@ -403,13 +651,29 @@ SPMV_KERNEL(csr_spmv_bf16_l32_kernel, SIMD_LANES, bfloat)
 SPMV_SPIKES_KERNEL(csr_spmv_spikes_l32_kernel, SIMD_LANES)
 SPMV_T_KERNEL(csc_spmv_t_l32_kernel, SIMD_LANES)
 FUSED_LIF_KERNEL(fused_spmv_lif_l32_kernel, SIMD_LANES)
+FUSED_SPIKES_LIF_KERNEL(fused_spmv_spikes_lif_l32_kernel, SIMD_LANES)
 SPMM_KERNEL(csr_spmm_l32_kernel, SIMD_LANES)
+SPMV_INDEXED_KERNEL(csr_spmv_indexed_l32_kernel,      SIMD_LANES, float)
+SPMV_INDEXED_KERNEL(csr_spmv_f16_indexed_l32_kernel,  SIMD_LANES, half)
+SPMV_INDEXED_KERNEL(csr_spmv_bf16_indexed_l32_kernel, SIMD_LANES, bfloat)
+SPMV_SPIKES_INDEXED_KERNEL(csr_spmv_spikes_indexed_l32_kernel, SIMD_LANES)
+SPMV_T_INDEXED_KERNEL(csc_spmv_t_indexed_l32_kernel, SIMD_LANES)
+FUSED_LIF_INDEXED_KERNEL(fused_spmv_lif_indexed_l32_kernel, SIMD_LANES)
+FUSED_SPIKES_LIF_INDEXED_KERNEL(fused_spmv_spikes_lif_indexed_l32_kernel, SIMD_LANES)
+SPMM_INDEXED_KERNEL(csr_spmm_indexed_l32_kernel, SIMD_LANES)
 
 #undef SPMV_KERNEL
 #undef SPMV_SPIKES_KERNEL
 #undef SPMV_T_KERNEL
 #undef FUSED_LIF_KERNEL
+#undef FUSED_SPIKES_LIF_KERNEL
 #undef SPMM_KERNEL
+#undef SPMV_INDEXED_KERNEL
+#undef SPMV_SPIKES_INDEXED_KERNEL
+#undef SPMV_T_INDEXED_KERNEL
+#undef FUSED_LIF_INDEXED_KERNEL
+#undef FUSED_SPIKES_LIF_INDEXED_KERNEL
+#undef SPMM_INDEXED_KERNEL
 
 /// Y += A * X for a batch of `n_vec` dense vectors, one thread per output
 /// element: the one-lane tier's SpMM.
@@ -463,6 +727,54 @@ kernel void csr_spmm_kernel(
         sum += values[i] * x[(ulong)col_ind[i] * n_vec + v];
     }
     y[out_idx] += sum;
+}
+
+/// Compact row-indexed scalar SpMM for degree-skew hybrid splits.
+kernel void csr_spmm_indexed_kernel(
+    device const uint*  row_ptr  [[buffer(0)]],
+    device const uint*  col_ind  [[buffer(1)]],
+    device const float* values   [[buffer(2)]],
+    device const float* x        [[buffer(3)]],
+    device float*       y        [[buffer(4)]],
+    device const uint*  row_ids  [[buffer(5)]],
+    constant uint&      n_active [[buffer(6)]],
+    constant uint&      n_vec    [[buffer(7)]],
+    uint2 id [[thread_position_in_grid]]
+) {
+    const uint v = id.x;
+    const uint idx = id.y;
+    if (idx >= n_active || v >= n_vec) { return; }
+    const uint row = row_ids[idx];
+    const ulong out_idx = (ulong)row * n_vec + v;
+    uint row_start = row_ptr[idx];
+    uint row_end   = row_ptr[idx + 1];
+    float sum = 0.0f;
+    for (uint i = row_start; i < row_end; ++i) {
+        sum += values[i] * x[(ulong)col_ind[i] * n_vec + v];
+    }
+    y[out_idx] += sum;
+}
+
+/// Bitpack `uchar` output spikes (`0`/`1` per cell) into `uint` words (32
+/// spikes per word, LSB-first) directly on device so multi-tick recurrent SNN
+/// loops never bounce spikes through the host.
+kernel void pack_uchar_spikes_kernel(
+    device const uchar* spikes_u8 [[buffer(0)]],
+    device uint*        packed    [[buffer(1)]],
+    constant uint&      n_spikes  [[buffer(2)]],
+    constant uint&      n_words   [[buffer(3)]],
+    uint word_idx [[thread_position_in_grid]]
+) {
+    if (word_idx >= n_words) { return; }
+    const uint base = word_idx * 32u;
+    uint word = 0u;
+    for (uint b = 0u; b < 32u; ++b) {
+        const uint cell = base + b;
+        if (cell < n_spikes && spikes_u8[cell] != 0u) {
+            word |= (1u << b);
+        }
+    }
+    packed[word_idx] = word;
 }
 
 // =============================================================================

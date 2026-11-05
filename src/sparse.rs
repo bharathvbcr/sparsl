@@ -222,6 +222,12 @@ impl Csr {
         self.ncols
     }
 
+    /// Consume this CSR and return `(row_ptr, col, ncols)` without copying.
+    #[inline]
+    pub fn into_parts(self) -> (Vec<u32>, Vec<u32>, usize) {
+        (self.row_ptr, self.col, self.ncols)
+    }
+
     /// Column indices of neighbors for `row`.
     ///
     /// Panics if `row >= nrows()`.
@@ -347,29 +353,33 @@ impl Csc {
     /// Degree tallies, column pointers, and edge ids use `checked_add` /
     /// `u32::try_from` so a hostile unchecked CSR cannot wrap `u32` counters.
     pub fn from_csr_rect(csr: &Csr, ncols: usize) -> Result<Self, CsrError> {
+        Self::from_csr_slices(csr.row_ptr(), csr.col(), ncols)
+    }
+
+    /// Build CSC fan-in directly from borrowed CSR slices and an explicit width,
+    /// avoiding any intermediate [`Csr`] allocation when a caller holds raw arrays.
+    pub fn from_csr_slices(row_ptr: &[u32], col: &[u32], ncols: usize) -> Result<Self, CsrError> {
         // `Csr` has an explicitly unchecked constructor, so a public API that
-        // accepts `&Csr` cannot assume these invariants still hold. Besides
-        // contradicting this module's contract, trusting `row_ptr` here used
-        // to turn an nnz mismatch into an indexing panic below.
-        validate(csr.row_ptr(), csr.col(), ncols)?;
+        // accepts `&Csr` or raw slices cannot assume these invariants hold.
+        validate(row_ptr, col, ncols)?;
 
         if ncols == 0 {
             // An operator with no columns can still have rows; it just has
             // nowhere to store an edge. A non-empty `col` here means the CSR
             // and the declared width disagree.
-            return match csr.col().first() {
-                Some(&col) => Err(CsrError::ColumnOutOfRange { col, ncols }),
+            return match col.first() {
+                Some(&c) => Err(CsrError::ColumnOutOfRange { col: c, ncols }),
                 None => Ok(Self::empty(0)),
             };
         }
-        let nnz = csr.nnz();
+        let nnz = col.len();
         let mut degrees = vec![0u32; ncols];
-        for &c in csr.col() {
-            let col = c as usize;
-            if col >= ncols {
+        for &c in col {
+            let col_idx = c as usize;
+            if col_idx >= ncols {
                 return Err(CsrError::ColumnOutOfRange { col: c, ncols });
             }
-            degrees[col] = degrees[col]
+            degrees[col_idx] = degrees[col_idx]
                 .checked_add(1)
                 .ok_or(CsrError::OffsetOverflow {
                     what: "column degree",
@@ -388,14 +398,17 @@ impl Csc {
 
         let mut row = vec![0u32; nnz];
         let mut edge_idx = vec![0u32; nnz];
-        let mut next = col_ptr[..ncols].to_vec();
-        for r in 0..csr.nrows() {
-            let start = csr.row_ptr()[r] as usize;
-            let end = csr.row_ptr()[r + 1] as usize;
+        degrees.copy_from_slice(&col_ptr[..ncols]);
+        let next = &mut degrees;
+        let nrows = row_ptr.len().saturating_sub(1);
+        for r in 0..nrows {
+            let start = row_ptr[r] as usize;
+            let end = row_ptr[r + 1] as usize;
             let row_u32 =
                 u32::try_from(r).map_err(|_| CsrError::OffsetOverflow { what: "row index" })?;
-            for e in start..end {
-                let c = csr.col()[e] as usize;
+            for (offset, &col_raw) in col[start..end].iter().enumerate() {
+                let e = start + offset;
+                let c = col_raw as usize;
                 let slot = next[c] as usize;
                 row[slot] = row_u32;
                 edge_idx[slot] = u32::try_from(e)
@@ -799,5 +812,23 @@ mod tests {
                 prop_assert_eq!(&got, &expected);
             }
         }
+    }
+
+    #[test]
+    fn csr_into_parts_and_csc_from_slices_preserve_allocations_and_values() {
+        let row_ptr = vec![0u32, 2, 3];
+        let col = vec![0u32, 2, 1];
+        let rp_ptr = row_ptr.as_ptr();
+        let col_ptr_raw = col.as_ptr();
+        let csr = Csr::from_parts(row_ptr, col, 4).expect("valid rectangular csr");
+        let csc_via_csr = Csc::from_csr_rect(&csr, 4).expect("csc via csr");
+        let csc_via_slices =
+            Csc::from_csr_slices(csr.row_ptr(), csr.col(), 4).expect("csc via slices");
+        assert_eq!(csc_via_csr, csc_via_slices);
+
+        let (out_rp, out_col, out_ncols) = csr.into_parts();
+        assert_eq!(out_rp.as_ptr(), rp_ptr, "into_parts must move row_ptr");
+        assert_eq!(out_col.as_ptr(), col_ptr_raw, "into_parts must move col");
+        assert_eq!(out_ncols, 4);
     }
 }

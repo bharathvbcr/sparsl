@@ -166,6 +166,8 @@ mod host_copy_probe {
     thread_local! {
         static HOST_COPY_TRACKING: Cell<bool> = const { Cell::new(false) };
         static HOST_COPY_COUNT: Cell<usize> = const { Cell::new(0) };
+        static SUBMISSION_TRACKING: Cell<bool> = const { Cell::new(false) };
+        static SUBMISSION_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn note_host_copy() {
@@ -185,12 +187,32 @@ mod host_copy_probe {
         HOST_COPY_TRACKING.with(|on| on.set(false));
         HOST_COPY_COUNT.with(|c| c.replace(0))
     }
+
+    pub(super) fn note_submission() {
+        SUBMISSION_TRACKING.with(|on| {
+            if on.get() {
+                SUBMISSION_COUNT.with(|c| c.set(c.get() + 1));
+            }
+        });
+    }
+
+    pub(crate) fn begin_submission_probe() {
+        SUBMISSION_COUNT.with(|c| c.set(0));
+        SUBMISSION_TRACKING.with(|on| on.set(true));
+    }
+
+    pub(crate) fn end_submission_probe() -> usize {
+        SUBMISSION_TRACKING.with(|on| on.set(false));
+        SUBMISSION_COUNT.with(|c| c.replace(0))
+    }
 }
 
 #[cfg(test)]
-use host_copy_probe::note_host_copy;
+pub(crate) use host_copy_probe::{
+    begin_host_copy_probe, begin_submission_probe, end_host_copy_probe, end_submission_probe,
+};
 #[cfg(test)]
-pub(crate) use host_copy_probe::{begin_host_copy_probe, end_host_copy_probe};
+use host_copy_probe::{note_host_copy, note_submission};
 
 /// How many lanes a line gets in the line-parallel kernels.
 ///
@@ -570,6 +592,15 @@ struct LinePipelines {
     /// the same order as the one-lane SpMV.
     spmm: ComputePipelineState,
     fused: ComputePipelineState,
+    fused_spikes: ComputePipelineState,
+    spmv_indexed: ComputePipelineState,
+    spmv_f16_indexed: ComputePipelineState,
+    spmv_bf16_indexed: ComputePipelineState,
+    spmv_spikes_indexed: ComputePipelineState,
+    spmv_t_indexed: ComputePipelineState,
+    spmm_indexed: ComputePipelineState,
+    fused_indexed: ComputePipelineState,
+    fused_spikes_indexed: ComputePipelineState,
 }
 
 pub struct MetalDevice {
@@ -583,6 +614,7 @@ pub struct MetalDevice {
     scan_offsets: ComputePipelineState,
     scan_apply: ComputePipelineState,
     lif: ComputePipelineState,
+    pack_uchar_spikes: ComputePipelineState,
     /// Grow-only device buffers for [`MetalDevice::assoc_scan`].
     ///
     /// A scan has no persistent operator to hang buffers off, so these were
@@ -599,12 +631,18 @@ pub struct MetalDevice {
     /// nothing real: `assoc_scan` already blocks on `submit_and_wait`, so two
     /// threads scanning at once were contending for the same GPU regardless.
     scan_scratch: Mutex<Option<ScanScratch>>,
+    /// Grow-only device and host buffers for [`MetalDevice::lif_integrate`].
+    ///
+    /// Like `assoc_scan`, dense `lif_integrate` has no prepared operator to
+    /// own operand buffers; allocating four `MTLBuffer`s and a `Vec<u8>` on
+    /// every call dominated sub-millisecond LIF steps. Buffers grow to the
+    /// high-water mark and re-arm logical-prefix sentinels per call.
+    lif_scratch: Mutex<Option<LifScratch>>,
     /// Completion timeline for the two device-level paths that own no
     /// operator scratch, `assoc_scan` and dense `lif_integrate`. Held across
     /// submit-and-wait, so those two serialise with each other; a scan already
-    /// serialises on `scan_scratch`, and the dense LIF path is documented as a
-    /// correctness path rather than a throughput one. Replaced together with
-    /// [`Self::queue`] on a successful [`reset_runtime`].
+    /// serialises on `scan_scratch`, and dense LIF serialises on `lif_scratch`.
+    /// Replaced together with [`Self::queue`] on a successful [`reset_runtime`].
     completion: Mutex<Completion>,
 }
 
@@ -619,16 +657,26 @@ struct ScanScratch {
     groups: usize,
 }
 
+/// Reusable device buffers for dense [`MetalDevice::lif_integrate`].
+struct LifScratch {
+    v: Guarded,
+    theta: Guarded,
+    currents: Buffer,
+    spikes: Guarded,
+    /// Elements these buffers were sized for.
+    n: usize,
+}
+
 // SAFETY: every field is a Metal object Apple documents as safe to use from
 // multiple threads — `MTLDevice`, `MTLCommandQueue` and `MTLComputePipelineState`
 // are all thread-safe, and the pipelines are built once in `open_uncached` and
 // never mutated afterwards. The struct is reached only through an `Arc` handed
 // out by `shared()`.
 //
-// `queue`, `scan_scratch` and `completion` are the mutable fields, and they are
-// mutable only behind a `Mutex`: every access takes the lock, so the queue,
-// buffers and the timeline counter inside are reached by one thread at a time
-// and no dispatch reads them outside the guard that submitted it. That is the
+// `queue`, `scan_scratch`, `lif_scratch` and `completion` are the mutable fields,
+// and they are mutable only behind a `Mutex`: every access takes the lock, so
+// the queue, buffers and the timeline counter inside are reached by one thread
+// at a time and no dispatch reads them outside the guard that submitted it. That is the
 // same discipline the per-operator `Scratch` already relies on. `MTLSharedEvent`
 // itself is documented by Apple as safe to signal and wait on from any thread —
 // it exists for cross-queue and cross-process synchronisation.
@@ -714,6 +762,22 @@ impl MetalDevice {
                     RowKernel::Vec8 | RowKernel::Simd => pipeline(&format!("csr_spmm_{s}_kernel"))?,
                 },
                 fused: pipeline(&format!("fused_spmv_lif_{s}_kernel"))?,
+                fused_spikes: pipeline(&format!("fused_spmv_spikes_lif_{s}_kernel"))?,
+                spmv_indexed: pipeline(&format!("csr_spmv_indexed_{s}_kernel"))?,
+                spmv_f16_indexed: pipeline(&format!("csr_spmv_f16_indexed_{s}_kernel"))?,
+                spmv_bf16_indexed: pipeline(&format!("csr_spmv_bf16_indexed_{s}_kernel"))?,
+                spmv_spikes_indexed: pipeline(&format!("csr_spmv_spikes_indexed_{s}_kernel"))?,
+                spmv_t_indexed: pipeline(&format!("csc_spmv_t_indexed_{s}_kernel"))?,
+                spmm_indexed: match tier {
+                    RowKernel::Scalar => pipeline("csr_spmm_indexed_kernel")?,
+                    RowKernel::Vec8 | RowKernel::Simd => {
+                        pipeline(&format!("csr_spmm_indexed_{s}_kernel"))?
+                    }
+                },
+                fused_indexed: pipeline(&format!("fused_spmv_lif_indexed_{s}_kernel"))?,
+                fused_spikes_indexed: pipeline(&format!(
+                    "fused_spmv_spikes_lif_indexed_{s}_kernel"
+                ))?,
             })
         };
         let tiers = [
@@ -725,6 +789,7 @@ impl MetalDevice {
         let scan_offsets = pipeline("scan_block_offsets")?;
         let scan_apply = pipeline("scan_apply_offsets")?;
         let lif = pipeline("lif_integrate_kernel")?;
+        let pack_uchar_spikes = pipeline("pack_uchar_spikes_kernel")?;
 
         // `SIMD_WIDTH` is baked into both sides of every team kernel: the host
         // sizes threadgroups as whole multiples of it so an `LPR`-lane team
@@ -742,8 +807,10 @@ impl MetalDevice {
         // assumption is checked here rather than assumed from the marketing
         // name of the platform. Every pipeline is listed rather than one
         // checked as a proxy: they are separately compiled functions.
-        let mut widths: Vec<(String, &ComputePipelineState)> =
-            vec![("lif_integrate_kernel".to_string(), &lif)];
+        let mut widths: Vec<(String, &ComputePipelineState)> = vec![
+            ("lif_integrate_kernel".to_string(), &lif),
+            ("pack_uchar_spikes_kernel".to_string(), &pack_uchar_spikes),
+        ];
         for tier in RowKernel::ALL {
             let s = tier.suffix();
             let p = &tiers[tier as usize];
@@ -755,6 +822,30 @@ impl MetalDevice {
                 (format!("csc_spmv_t_{s}_kernel"), &p.spmv_t),
                 (format!("csr_spmm_{s}_kernel"), &p.spmm),
                 (format!("fused_spmv_lif_{s}_kernel"), &p.fused),
+                (format!("fused_spmv_spikes_lif_{s}_kernel"), &p.fused_spikes),
+                (format!("csr_spmv_indexed_{s}_kernel"), &p.spmv_indexed),
+                (
+                    format!("csr_spmv_f16_indexed_{s}_kernel"),
+                    &p.spmv_f16_indexed,
+                ),
+                (
+                    format!("csr_spmv_bf16_indexed_{s}_kernel"),
+                    &p.spmv_bf16_indexed,
+                ),
+                (
+                    format!("csr_spmv_spikes_indexed_{s}_kernel"),
+                    &p.spmv_spikes_indexed,
+                ),
+                (format!("csc_spmv_t_indexed_{s}_kernel"), &p.spmv_t_indexed),
+                (format!("csr_spmm_indexed_{s}_kernel"), &p.spmm_indexed),
+                (
+                    format!("fused_spmv_lif_indexed_{s}_kernel"),
+                    &p.fused_indexed,
+                ),
+                (
+                    format!("fused_spmv_spikes_lif_indexed_{s}_kernel"),
+                    &p.fused_spikes_indexed,
+                ),
             ]);
         }
         for (name, pipeline) in widths {
@@ -779,7 +870,9 @@ impl MetalDevice {
             scan_offsets,
             scan_apply,
             lif,
+            pack_uchar_spikes,
             scan_scratch: Mutex::new(None),
+            lif_scratch: Mutex::new(None),
             completion,
         })
     }
@@ -990,7 +1083,8 @@ impl MetalDevice {
         let scratch = Scratch {
             x: self.alloc::<f32>(shape.ncols, "x")?,
             x_external: None,
-            x_spikes: self.alloc::<u32>(crate::spikes::packed_len(shape.ncols), "x_spikes")?,
+            x_spikes: self
+                .alloc_guarded::<u32>(crate::spikes::packed_len(shape.ncols), "x_spikes")?,
             y: self.alloc_guarded::<f32>(shape.nrows, "y")?,
             y_external: None,
             // Allocated only alongside the reverse index, so a forward-only
@@ -1009,7 +1103,6 @@ impl MetalDevice {
             v: self.alloc_guarded::<f32>(shape.nrows, "v")?,
             theta: self.alloc_guarded::<f32>(shape.nrows, "theta")?,
             spikes: self.alloc_guarded::<u8>(shape.nrows, "spikes")?,
-            spikes_host: vec![0u8; shape.nrows],
             completion: self.new_completion()?,
         };
         Ok(MetalSparse {
@@ -1158,12 +1251,11 @@ impl MetalDevice {
 
     /// Dense LIF integrate with no prepared operator.
     ///
-    /// Allocates its operands on every call. That is deliberate: without a CSR
-    /// there is nothing to bind to, and W0's measurements say allocation is the
-    /// expensive part of a GPU call. This exists so the Metal backend has a
-    /// dense arm the differential suite can check against the CPU reference —
-    /// it is a correctness path, not a throughput path. For throughput, prepare
-    /// an operator and call `fused_spmv_lif`.
+    /// Reuses grow-only device and host scratch buffers on [`MetalDevice`],
+    /// arming logical-prefix sentinels on every call so shorter dispatches
+    /// after a larger one still catch any out-of-bounds device write. When a
+    /// CSR operator is also being stepped, prefer `fused_spmv_lif` to avoid the
+    /// intermediate host current round-trip altogether.
     pub fn lif_integrate(
         &self,
         v: &mut [f32],
@@ -1182,28 +1274,49 @@ impl MetalDevice {
                 reason: "LIF length exceeds the Metal kernel's u32 index range",
             });
         }
-        let v_buf = self
-            .alloc_guarded::<f32>(n, "v")
-            .map_err(|_| OpError::Backend {
-                reason: "LIF: could not allocate voltage",
-            })?;
-        v_buf.write(v);
-        let theta_buf = self
-            .alloc_guarded::<f32>(n, "theta")
-            .map_err(|_| OpError::Backend {
-                reason: "LIF: could not allocate threshold",
-            })?;
-        theta_buf.write(theta);
-        let currents_buf = self
-            .upload(currents, "currents")
-            .map_err(|_| OpError::Backend {
-                reason: "LIF: could not upload currents",
-            })?;
-        let spikes_buf = self
-            .alloc_guarded::<u8>(n, "spikes")
-            .map_err(|_| OpError::Backend {
-                reason: "LIF: could not allocate spike output",
-            })?;
+        let mut slot = self.lif_scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl LIF scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        let needs_growth = match slot.as_ref() {
+            Some(existing) => existing.n < n,
+            None => true,
+        };
+        if needs_growth {
+            *slot = None;
+            *slot = Some(LifScratch {
+                v: self
+                    .alloc_guarded::<f32>(n, "v")
+                    .map_err(|_| OpError::Backend {
+                        reason: "LIF: could not allocate voltage",
+                    })?,
+                theta: self
+                    .alloc_guarded::<f32>(n, "theta")
+                    .map_err(|_| OpError::Backend {
+                        reason: "LIF: could not allocate threshold",
+                    })?,
+                currents: self
+                    .alloc::<f32>(n, "currents")
+                    .map_err(|_| OpError::Backend {
+                        reason: "LIF: could not allocate currents",
+                    })?,
+                spikes: self
+                    .alloc_guarded::<u8>(n, "spikes")
+                    .map_err(|_| OpError::Backend {
+                        reason: "LIF: could not allocate spike output",
+                    })?,
+                n,
+            });
+        }
+        let scratch = slot.as_mut().expect("LIF scratch was just ensured present");
+
+        let f32_bytes = std::mem::size_of_val(v);
+        scratch.v.arm_at(f32_bytes);
+        scratch.theta.arm_at(f32_bytes);
+        scratch.spikes.arm_at(n);
+        scratch.v.write(v);
+        scratch.theta.write(theta);
+        write_from(&scratch.currents, &currents[..n]);
 
         let tg = self.threadgroup_for(&self.lif);
         let cb = self.command_buffer("LIF: Metal returned no command buffer")?;
@@ -1211,32 +1324,30 @@ impl MetalDevice {
             reason: "LIF: Metal returned no compute encoder",
         })?;
         enc.setComputePipelineState(&self.lif);
-        set_buf(&enc, 0, &v_buf.buffer);
-        set_buf(&enc, 1, &theta_buf.buffer);
-        set_buf(&enc, 2, &currents_buf);
-        set_buf(&enc, 3, &spikes_buf.buffer);
+        set_buf(&enc, 0, &scratch.v.buffer);
+        set_buf(&enc, 1, &scratch.theta.buffer);
+        set_buf(&enc, 2, &scratch.currents);
+        set_buf(&enc, 3, &scratch.spikes.buffer);
         set_f32(&enc, 4, params.decay());
         set_f32(&enc, 5, params.v_reset());
         set_f32(&enc, 6, params.delta_theta());
         set_u32(&enc, 7, n as u32);
         enc.dispatchThreads_threadsPerThreadgroup(size(n), size(tg));
         enc.endEncoding();
+        // Lock order: `lif_scratch` (held) then `completion`, matching `scan_scratch`.
         let mut completion = self.completion.lock().map_err(|_| OpError::Backend {
             reason: "sparsl completion mutex is poisoned",
         })?;
         submit_and_wait(cb, "LIF integrate", &mut completion)?;
         drop(completion);
 
-        v_buf.assert_intact();
-        theta_buf.assert_intact();
-        spikes_buf.assert_intact();
-        read_into(&v_buf.buffer, v);
-        read_into(&theta_buf.buffer, theta);
-        let mut host = vec![0u8; n];
-        read_into(&spikes_buf.buffer, &mut host);
-        for (dst, &src) in spikes.iter_mut().zip(host.iter()) {
-            *dst = src != 0;
-        }
+        scratch.v.assert_intact_at(f32_bytes);
+        scratch.theta.assert_intact_at(f32_bytes);
+        scratch.spikes.assert_intact_at(n);
+        read_into(&scratch.v.buffer, v);
+        read_into(&scratch.theta.buffer, theta);
+        read_u8_spikes_as_bool(&scratch.spikes.buffer, &mut spikes[..n]);
+        drop(slot);
         Ok(())
     }
 }
@@ -1338,9 +1449,9 @@ struct Scratch {
     /// When set, kernels bind this instead of [`Self::x`] and host uploads of
     /// `x` are skipped (caller-owned `MTLBuffer` handoff).
     x_external: Option<Buffer>,
-    /// Packed spike vector, `packed_len(ncols)` words. Allocated with the rest
-    /// so the spike path costs no per-call allocation either.
-    x_spikes: Buffer,
+    /// Packed spike vector, `packed_len(ncols)` words, with sentinel tail so
+    /// on-GPU `pack_uchar_spikes_kernel` writes are bounds-checked too.
+    x_spikes: Guarded,
     y: Guarded,
     /// When set, kernels bind this instead of [`Self::y`]'s usable region and
     /// host y round-trips are skipped. External `y` has no canary tail.
@@ -1362,7 +1473,6 @@ struct Scratch {
     v: Guarded,
     theta: Guarded,
     spikes: Guarded,
-    spikes_host: Vec<u8>,
     /// This operator's completion timeline. It lives with the scratch because
     /// the scratch mutex is what serialises this operator's submissions, and
     /// serialised submission is what keeps the signalled values monotonic.
@@ -1433,10 +1543,14 @@ struct TransposeIndex {
     edge_idx: Buffer,
 }
 
-/// One side of a degree-skew hybrid: packed CSR (empty rows for the other
-/// class) with its own col/values and a fixed tier.
+/// One side of a degree-skew hybrid: compact CSR over `n_rows` active rows in
+/// this degree class (`row_ids` maps `0..n_rows` back to destination rows in
+/// `0..nrows`), eliminating empty-row thread launches and enabling single-pass
+/// fused LIF across disjoint `long ⊔ short` row partitions.
 struct HybridSide {
     row_ptr: Buffer,
+    row_ids: Buffer,
+    n_rows: usize,
     col: Buffer,
     values: Buffer,
     values_narrow: Option<Buffer>,
@@ -1452,16 +1566,24 @@ struct HybridForward {
     short: HybridSide,
 }
 
-/// Column-side hybrid for the transposed product.
-struct HybridTranspose {
-    long: TransposeIndex,
-    short: TransposeIndex,
-    long_kernel: RowKernel,
-    short_kernel: RowKernel,
+/// Compact column-indexed CSC partition for one degree-skew class.
+struct HybridTransposeSide {
+    col_ptr: Buffer,
+    col_ids: Buffer,
+    n_cols: usize,
+    row: Buffer,
+    edge_idx: Buffer,
+    kernel: RowKernel,
 }
 
-/// Packed CSR for one hybrid class: rows that fail `keep` are empty.
-type PackedHybridSide = (Vec<u32>, Vec<u32>, Vec<f32>, Vec<(usize, usize)>);
+/// Column-side hybrid for the transposed product.
+struct HybridTranspose {
+    long: HybridTransposeSide,
+    short: HybridTransposeSide,
+}
+
+/// Compact CSR for one hybrid class: `(row_ptr, row_ids, col, vals, src_edges)`.
+type PackedHybridSide = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<(usize, usize)>);
 
 fn pack_hybrid_side(
     csr: &Csr,
@@ -1470,7 +1592,8 @@ fn pack_hybrid_side(
 ) -> PackedHybridSide {
     let nrows = csr.nrows();
     let rp = csr.row_ptr();
-    let mut row_ptr = Vec::with_capacity(nrows + 1);
+    let mut row_ptr = Vec::new();
+    let mut row_ids = Vec::new();
     let mut col = Vec::new();
     let mut vals = Vec::new();
     let mut src_edges = Vec::new();
@@ -1480,13 +1603,16 @@ fn pack_hybrid_side(
         let e = rp[r + 1] as usize;
         let nnz = e - s;
         if keep(r, nnz) {
-            col.extend_from_slice(&csr.col()[s..e]);
-            vals.extend_from_slice(&weights[s..e]);
-            src_edges.push((s, e));
+            row_ids.push(r as u32);
+            if nnz > 0 {
+                col.extend_from_slice(&csr.col()[s..e]);
+                vals.extend_from_slice(&weights[s..e]);
+                src_edges.push((s, e));
+            }
+            row_ptr.push(col.len() as u32);
         }
-        row_ptr.push(col.len() as u32);
     }
-    (row_ptr, col, vals, src_edges)
+    (row_ptr, row_ids, col, vals, src_edges)
 }
 
 fn skew_triggers_hybrid(lines: usize, nnz: usize, max_nnz: usize) -> bool {
@@ -1528,13 +1654,16 @@ fn build_hybrid_forward(
                        kernel: RowKernel,
                        tag: &'static str|
      -> Result<HybridSide, SparsePlanError> {
-        let (row_ptr, col, vals, src_edges) = pack_hybrid_side(csr, weights, keep);
+        let (row_ptr, row_ids, col, vals, src_edges) = pack_hybrid_side(csr, weights, keep);
+        let n_rows = row_ids.len();
         let values_narrow = match precision.narrow_bits(&vals) {
             Some(bits) => Some(device.upload(&bits, tag)?),
             None => None,
         };
         Ok(HybridSide {
             row_ptr: device.upload(&row_ptr, tag)?,
+            row_ids: device.upload(&row_ids, tag)?,
+            n_rows,
             col: device.upload(&col, tag)?,
             values: device.upload(&vals, tag)?,
             values_narrow,
@@ -1552,6 +1681,7 @@ fn build_hybrid_forward(
         short_kernel,
         "hybrid_short",
     )?;
+    debug_assert_eq!(long.n_rows + short.n_rows, shape.nrows());
     Ok(Some(HybridForward { long, short }))
 }
 
@@ -1566,9 +1696,10 @@ fn max_col_nnz(csc: &Csc) -> usize {
 fn pack_hybrid_csc(
     csc: &Csc,
     keep: impl Fn(usize, usize) -> bool,
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let ncols = csc.col_ptr.len().saturating_sub(1);
-    let mut col_ptr = Vec::with_capacity(ncols + 1);
+    let mut col_ptr = Vec::new();
+    let mut col_ids = Vec::new();
     let mut row = Vec::new();
     let mut edge_idx = Vec::new();
     col_ptr.push(0);
@@ -1577,12 +1708,15 @@ fn pack_hybrid_csc(
         let e = csc.col_ptr[c + 1] as usize;
         let nnz = e - s;
         if keep(c, nnz) {
-            row.extend_from_slice(&csc.row[s..e]);
-            edge_idx.extend_from_slice(&csc.edge_idx[s..e]);
+            col_ids.push(c as u32);
+            if nnz > 0 {
+                row.extend_from_slice(&csc.row[s..e]);
+                edge_idx.extend_from_slice(&csc.edge_idx[s..e]);
+            }
+            col_ptr.push(row.len() as u32);
         }
-        col_ptr.push(row.len() as u32);
     }
-    (col_ptr, row, edge_idx)
+    (col_ptr, col_ids, row, edge_idx)
 }
 
 fn build_hybrid_transpose(
@@ -1612,20 +1746,31 @@ fn build_hybrid_transpose(
     }
     let short_kernel = RowKernel::for_shape(n_short, short_nnz);
     let upload = |keep: fn(usize, usize) -> bool,
+                  kernel: RowKernel,
                   tag: &'static str|
-     -> Result<TransposeIndex, SparsePlanError> {
-        let (col_ptr, row, edge_idx) = pack_hybrid_csc(csc, keep);
-        Ok(TransposeIndex {
+     -> Result<HybridTransposeSide, SparsePlanError> {
+        let (col_ptr, col_ids, row, edge_idx) = pack_hybrid_csc(csc, keep);
+        let n_cols = col_ids.len();
+        Ok(HybridTransposeSide {
             col_ptr: device.upload(&col_ptr, tag)?,
+            col_ids: device.upload(&col_ids, tag)?,
+            n_cols,
             row: device.upload(&row, tag)?,
             edge_idx: device.upload(&edge_idx, tag)?,
+            kernel,
         })
     };
     Ok(Some(HybridTranspose {
-        long: upload(|_, nnz| nnz >= SIMD_ROW_MIN_MEAN_NNZ, "hybrid_t_long")?,
-        short: upload(|_, nnz| nnz < SIMD_ROW_MIN_MEAN_NNZ, "hybrid_t_short")?,
-        long_kernel: RowKernel::Simd,
-        short_kernel,
+        long: upload(
+            |_, nnz| nnz >= SIMD_ROW_MIN_MEAN_NNZ,
+            RowKernel::Simd,
+            "hybrid_t_long",
+        )?,
+        short: upload(
+            |_, nnz| nnz < SIMD_ROW_MIN_MEAN_NNZ,
+            short_kernel,
+            "hybrid_t_short",
+        )?,
     }))
 }
 
@@ -1823,6 +1968,17 @@ impl MetalSparse {
         Ok(())
     }
 
+    /// Upload bitpacked spikes into resident `x_spikes` scratch without dispatching.
+    pub fn write_x_spikes(&self, spikes: &[u32]) -> Result<(), OpError> {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        ensure_device_healthy()?;
+        let words = crate::spikes::packed_len(self.shape.ncols);
+        guard.x_spikes.write(&spikes[..words]);
+        Ok(())
+    }
+
     /// Upload `y` into resident scratch without dispatching.
     pub fn write_y(&self, y: &[f32]) -> Result<(), OpError> {
         let guard = self.scratch.lock().map_err(|_| OpError::Backend {
@@ -1871,6 +2027,87 @@ impl MetalSparse {
         Ok(())
     }
 
+    /// Fused bitpacked-spike SpMV+LIF on resident scratch; no host readback.
+    pub fn fused_spmv_spikes_lif_resident(&self, params: LifParams) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        let scratch = &mut *guard;
+        ensure_device_healthy()?;
+        self.dispatch_fused_spikes(scratch, params, false)?;
+        Ok(())
+    }
+
+    /// Pack resident output `spikes` (`uchar[nrows]`) into resident `x_spikes`
+    /// (`u32[packed_len(ncols)]`) directly on the GPU without any host copy.
+    /// Caller (`SparseOp`) validates `nrows == ncols`.
+    pub fn pack_resident_spikes_to_x_spikes(&self) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        let scratch = &mut *guard;
+        ensure_device_healthy()?;
+        let words = crate::spikes::packed_len(self.shape.ncols);
+        if words == 0 {
+            return Ok(());
+        }
+        let cb = self
+            .device
+            .command_buffer("pack spikes: Metal returned no command buffer")?;
+        let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
+            reason: "pack spikes: Metal returned no compute encoder",
+        })?;
+        encode_pack_uchar_spikes(self, &enc, scratch);
+        enc.endEncoding();
+        submit_and_wait(cb, "pack spikes", &mut scratch.completion)?;
+        scratch.x_spikes.assert_intact();
+        Ok(())
+    }
+
+    /// Multi-tick recurrent fused bitpacked-spike SpMV+LIF mega-submission:
+    /// encodes up to `MAX_RECURRENT_STEPS_PER_CB` recurrent ticks
+    /// (`fused_spikes_lif` -> `pack_uchar_spikes`) into a single serial
+    /// `MTLComputeCommandEncoder` and a single `MTLCommandBuffer`, eliminating
+    /// per-tick host synchronization and host-device copies altogether.
+    pub fn fused_spmv_spikes_lif_recurrent_steps(
+        &self,
+        params: LifParams,
+        steps: usize,
+    ) -> Result<(), OpError> {
+        const MAX_RECURRENT_STEPS_PER_CB: usize = 256;
+        if steps == 0 || self.shape.nrows == 0 {
+            return Ok(());
+        }
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        let scratch = &mut *guard;
+        ensure_device_healthy()?;
+
+        let mut remaining = steps;
+        while remaining > 0 {
+            let chunk = remaining.min(MAX_RECURRENT_STEPS_PER_CB);
+            let cb = self
+                .device
+                .command_buffer("recurrent fused SpMV+LIF: Metal returned no command buffer")?;
+            let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
+                reason: "recurrent fused SpMV+LIF: Metal returned no compute encoder",
+            })?;
+            for _ in 0..chunk {
+                self.encode_fused_spikes_step(&enc, scratch, params)?;
+                encode_pack_uchar_spikes(self, &enc, scratch);
+            }
+            enc.endEncoding();
+            submit_and_wait(cb, "recurrent fused SpMV+LIF", &mut scratch.completion)?;
+            remaining -= chunk;
+        }
+        scratch.v.assert_intact();
+        scratch.theta.assert_intact();
+        scratch.spikes.assert_intact();
+        scratch.x_spikes.assert_intact();
+        Ok(())
+    }
+
     /// Canary check + read `y` back to the host.
     pub fn sync_y(&self, y: &mut [f32]) -> Result<(), OpError> {
         let guard = self.scratch.lock().map_err(|_| OpError::Backend {
@@ -1891,7 +2128,7 @@ impl MetalSparse {
         theta: &mut [f32],
         spikes: &mut [bool],
     ) -> Result<(), OpError> {
-        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+        let guard = self.scratch.lock().map_err(|_| OpError::Backend {
             reason: "sparsl scratch mutex is poisoned",
         })?;
         ensure_device_healthy()?;
@@ -1900,18 +2137,7 @@ impl MetalSparse {
         guard.spikes.assert_intact();
         read_into(&guard.v.buffer, &mut v[..self.shape.nrows]);
         read_into(&guard.theta.buffer, &mut theta[..self.shape.nrows]);
-        let Scratch {
-            spikes: spikes_buf,
-            spikes_host,
-            ..
-        } = &mut *guard;
-        read_buffer_into(&spikes_buf.buffer, spikes_host);
-        for (dst, &src) in spikes[..self.shape.nrows]
-            .iter_mut()
-            .zip(spikes_host.iter())
-        {
-            *dst = src != 0;
-        }
+        read_u8_spikes_as_bool(&guard.spikes.buffer, &mut spikes[..self.shape.nrows]);
         Ok(())
     }
 
@@ -1985,77 +2211,160 @@ impl MetalSparse {
         Ok(())
     }
 
+    fn encode_fused_step(
+        &self,
+        enc: &ComputeEncoder,
+        scratch: &Scratch,
+        params: LifParams,
+    ) -> Result<(), OpError> {
+        let x = scratch.x_buf();
+        match self.hybrid.as_ref() {
+            Some(hybrid) => {
+                // `long` and `short` carry disjoint `row_ids` partitioning
+                // `0..nrows`, so both sides fuse current reduction + LIF state
+                // update directly into `v`/`theta`/`spikes` inside one encoder
+                // without zeroing or materialising `y`.
+                encode_hybrid_fused_side(
+                    &self.device,
+                    enc,
+                    &hybrid.long,
+                    x,
+                    &scratch.v.buffer,
+                    &scratch.theta.buffer,
+                    &scratch.spikes.buffer,
+                    params,
+                )?;
+                encode_hybrid_fused_side(
+                    &self.device,
+                    enc,
+                    &hybrid.short,
+                    x,
+                    &scratch.v.buffer,
+                    &scratch.theta.buffer,
+                    &scratch.spikes.buffer,
+                    params,
+                )?;
+            }
+            None => {
+                let pipeline = &self.device.tier(self.row_kernel).fused;
+                enc.setComputePipelineState(pipeline);
+                set_buf(enc, 0, &self.row_ptr);
+                set_buf(enc, 1, &self.col);
+                set_buf(enc, 2, &self.values);
+                set_buf(enc, 3, x);
+                set_buf(enc, 4, &scratch.v.buffer);
+                set_buf(enc, 5, &scratch.theta.buffer);
+                set_buf(enc, 6, &scratch.spikes.buffer);
+                set_f32(enc, 7, params.decay());
+                set_f32(enc, 8, params.v_reset());
+                set_f32(enc, 9, params.delta_theta());
+                set_u32(enc, 10, self.shape.nrows as u32);
+                dispatch_lines(
+                    enc,
+                    self.row_kernel,
+                    &self.device,
+                    pipeline,
+                    self.shape.nrows,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_fused_spikes_step(
+        &self,
+        enc: &ComputeEncoder,
+        scratch: &Scratch,
+        params: LifParams,
+    ) -> Result<(), OpError> {
+        let x_spikes = &scratch.x_spikes.buffer;
+        match self.hybrid.as_ref() {
+            Some(hybrid) => {
+                encode_hybrid_fused_spikes_side(
+                    &self.device,
+                    enc,
+                    &hybrid.long,
+                    x_spikes,
+                    &scratch.v.buffer,
+                    &scratch.theta.buffer,
+                    &scratch.spikes.buffer,
+                    params,
+                )?;
+                encode_hybrid_fused_spikes_side(
+                    &self.device,
+                    enc,
+                    &hybrid.short,
+                    x_spikes,
+                    &scratch.v.buffer,
+                    &scratch.theta.buffer,
+                    &scratch.spikes.buffer,
+                    params,
+                )?;
+            }
+            None => {
+                let pipeline = &self.device.tier(self.row_kernel).fused_spikes;
+                enc.setComputePipelineState(pipeline);
+                set_buf(enc, 0, &self.row_ptr);
+                set_buf(enc, 1, &self.col);
+                set_buf(enc, 2, &self.values);
+                set_buf(enc, 3, x_spikes);
+                set_buf(enc, 4, &scratch.v.buffer);
+                set_buf(enc, 5, &scratch.theta.buffer);
+                set_buf(enc, 6, &scratch.spikes.buffer);
+                set_f32(enc, 7, params.decay());
+                set_f32(enc, 8, params.v_reset());
+                set_f32(enc, 9, params.delta_theta());
+                set_u32(enc, 10, self.shape.nrows as u32);
+                dispatch_lines(
+                    enc,
+                    self.row_kernel,
+                    &self.device,
+                    pipeline,
+                    self.shape.nrows,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn dispatch_fused(
         &self,
         scratch: &mut Scratch,
         params: LifParams,
         check_canary: bool,
     ) -> Result<(), OpError> {
-        // Hybrid fused cannot run the fused kernel twice (empty rows would
-        // still LIF). Compose hybrid SpMV into `y` as currents, then LIF.
-        if self.hybrid.is_some() {
-            zero_f32_prefix(scratch.y_buf(), self.shape.nrows);
-            if scratch.y_external.is_none() {
-                scratch.y.arm();
-            }
-            self.dispatch_spmv(scratch, false)?;
-            // Inline the LIF kernel against resident v/theta and y-as-currents.
-            let pipeline = &self.device.lif;
-            let cb = self
-                .device
-                .command_buffer("hybrid fused LIF: Metal returned no command buffer")?;
-            let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
-                reason: "hybrid fused LIF: Metal returned no compute encoder",
-            })?;
-            enc.setComputePipelineState(pipeline);
-            set_buf(&enc, 0, &scratch.v.buffer);
-            set_buf(&enc, 1, &scratch.theta.buffer);
-            set_buf(&enc, 2, scratch.y_buf());
-            set_buf(&enc, 3, &scratch.spikes.buffer);
-            set_f32(&enc, 4, params.decay());
-            set_f32(&enc, 5, params.v_reset());
-            set_f32(&enc, 6, params.delta_theta());
-            set_u32(&enc, 7, self.shape.nrows as u32);
-            let tg = self.device.threadgroup_for(pipeline);
-            enc.dispatchThreads_threadsPerThreadgroup(size(self.shape.nrows), size(tg));
-            enc.endEncoding();
-            submit_and_wait(cb, "hybrid fused LIF", &mut scratch.completion)?;
-            if check_canary {
-                scratch.v.assert_intact();
-                scratch.theta.assert_intact();
-                scratch.spikes.assert_intact();
-            }
-            return Ok(());
-        }
-
-        let pipeline = &self.device.tier(self.row_kernel).fused;
         let cb = self
             .device
             .command_buffer("fused SpMV+LIF: Metal returned no command buffer")?;
         let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
             reason: "fused SpMV+LIF: Metal returned no compute encoder",
         })?;
-        enc.setComputePipelineState(pipeline);
-        set_buf(&enc, 0, &self.row_ptr);
-        set_buf(&enc, 1, &self.col);
-        set_buf(&enc, 2, &self.values);
-        set_buf(&enc, 3, scratch.x_buf());
-        set_buf(&enc, 4, &scratch.v.buffer);
-        set_buf(&enc, 5, &scratch.theta.buffer);
-        set_buf(&enc, 6, &scratch.spikes.buffer);
-        set_f32(&enc, 7, params.decay());
-        set_f32(&enc, 8, params.v_reset());
-        set_f32(&enc, 9, params.delta_theta());
-        set_u32(&enc, 10, self.shape.nrows as u32);
-        dispatch_lines(
-            &enc,
-            self.row_kernel,
-            &self.device,
-            pipeline,
-            self.shape.nrows,
-        );
+        self.encode_fused_step(&enc, scratch, params)?;
         enc.endEncoding();
         submit_and_wait(cb, "fused SpMV+LIF", &mut scratch.completion)?;
+        if check_canary {
+            scratch.v.assert_intact();
+            scratch.theta.assert_intact();
+            scratch.spikes.assert_intact();
+        }
+        Ok(())
+    }
+
+    fn dispatch_fused_spikes(
+        &self,
+        scratch: &mut Scratch,
+        params: LifParams,
+        check_canary: bool,
+    ) -> Result<(), OpError> {
+        let cb = self
+            .device
+            .command_buffer("fused spike SpMV+LIF: Metal returned no command buffer")?;
+        let enc = cb.computeCommandEncoder().ok_or(OpError::Backend {
+            reason: "fused spike SpMV+LIF: Metal returned no compute encoder",
+        })?;
+        self.encode_fused_spikes_step(&enc, scratch, params)?;
+        enc.endEncoding();
+        submit_and_wait(cb, "fused spike SpMV+LIF", &mut scratch.completion)?;
         if check_canary {
             scratch.v.assert_intact();
             scratch.theta.assert_intact();
@@ -2145,7 +2454,7 @@ impl MetalSparse {
 
         let max_tg = self
             .device
-            .threadgroup_for(&self.device.tier(RowKernel::Scalar).spmm);
+            .threadgroup_for(&self.device.tier(RowKernel::Scalar).spmm_indexed);
         let cb = self
             .device
             .command_buffer("SpMM: Metal returned no command buffer")?;
@@ -2160,7 +2469,6 @@ impl MetalSparse {
                     &hybrid.long,
                     &batch.x,
                     &batch.y.buffer,
-                    self.shape.nrows,
                     n_vec,
                     max_tg,
                 )?;
@@ -2170,7 +2478,6 @@ impl MetalSparse {
                     &hybrid.short,
                     &batch.x,
                     &batch.y.buffer,
-                    self.shape.nrows,
                     n_vec,
                     max_tg,
                 )?;
@@ -2188,7 +2495,8 @@ impl MetalSparse {
                 set_u32(&enc, 6, n_vec as u32);
                 match self.row_kernel {
                     RowKernel::Scalar => {
-                        let (grid, threads) = spmm_geometry(self.shape.nrows, n_vec, max_tg);
+                        let max_scalar_tg = self.device.threadgroup_for(pipeline);
+                        let (grid, threads) = spmm_geometry(self.shape.nrows, n_vec, max_scalar_tg);
                         enc.dispatchThreads_threadsPerThreadgroup(grid, threads);
                     }
                     RowKernel::Vec8 | RowKernel::Simd => {
@@ -2225,7 +2533,7 @@ impl MetalSparse {
         let scratch = &mut *guard;
         ensure_device_healthy()?;
         let words = crate::spikes::packed_len(self.shape.ncols);
-        write_from(&scratch.x_spikes, &spikes[..words]);
+        scratch.x_spikes.write(&spikes[..words]);
         scratch.y.write(y);
 
         let cb = self
@@ -2240,17 +2548,15 @@ impl MetalSparse {
                     &self.device,
                     &enc,
                     &hybrid.long,
-                    &scratch.x_spikes,
+                    &scratch.x_spikes.buffer,
                     &scratch.y.buffer,
-                    self.shape.nrows,
                 )?;
                 encode_hybrid_spikes_side(
                     &self.device,
                     &enc,
                     &hybrid.short,
-                    &scratch.x_spikes,
+                    &scratch.x_spikes.buffer,
                     &scratch.y.buffer,
-                    self.shape.nrows,
                 )?;
             }
             None => {
@@ -2259,7 +2565,7 @@ impl MetalSparse {
                 set_buf(&enc, 0, &self.row_ptr);
                 set_buf(&enc, 1, &self.col);
                 set_buf(&enc, 2, &self.values);
-                set_buf(&enc, 3, &scratch.x_spikes);
+                set_buf(&enc, 3, &scratch.x_spikes.buffer);
                 set_buf(&enc, 4, &scratch.y.buffer);
                 set_u32(&enc, 5, self.shape.nrows as u32);
                 dispatch_lines(
@@ -2322,21 +2628,17 @@ impl MetalSparse {
                     &self.device,
                     &enc,
                     &hybrid.long,
-                    hybrid.long_kernel,
                     &self.values,
                     xt,
                     &yt.buffer,
-                    self.shape.ncols,
                 )?;
                 encode_transpose_side(
                     &self.device,
                     &enc,
                     &hybrid.short,
-                    hybrid.short_kernel,
                     &self.values,
                     xt,
                     &yt.buffer,
-                    self.shape.ncols,
                 )?;
             }
             None => {
@@ -2390,15 +2692,34 @@ impl MetalSparse {
 
         read_into(&scratch.v.buffer, v);
         read_into(&scratch.theta.buffer, theta);
-        let Scratch {
-            spikes: spikes_buf,
-            spikes_host,
-            ..
-        } = &mut *scratch;
-        read_buffer_into(&spikes_buf.buffer, spikes_host);
-        for (dst, &src) in spikes.iter_mut().zip(spikes_host.iter()) {
-            *dst = src != 0;
-        }
+        read_u8_spikes_as_bool(&scratch.spikes.buffer, spikes);
+        drop(guard);
+        Ok(())
+    }
+
+    /// Fused bitpacked-spike SpMV + LIF. Lengths are checked by the caller.
+    pub fn fused_spmv_spikes_lif(
+        &self,
+        spikes_in: &[u32],
+        v: &mut [f32],
+        theta: &mut [f32],
+        spikes_out: &mut [bool],
+        params: LifParams,
+    ) -> Result<(), OpError> {
+        let mut guard = self.scratch.lock().map_err(|_| OpError::Backend {
+            reason: "sparsl scratch mutex is poisoned",
+        })?;
+        let scratch = &mut *guard;
+        ensure_device_healthy()?;
+        let words = crate::spikes::packed_len(self.shape.ncols);
+        scratch.x_spikes.write(&spikes_in[..words]);
+        scratch.v.write(v);
+        scratch.theta.write(theta);
+        self.dispatch_fused_spikes(scratch, params, true)?;
+
+        read_into(&scratch.v.buffer, v);
+        read_into(&scratch.theta.buffer, theta);
+        read_u8_spikes_as_bool(&scratch.spikes.buffer, spikes_out);
         drop(guard);
         Ok(())
     }
@@ -2408,6 +2729,86 @@ impl MetalSparse {
 // Small helpers
 // ---------------------------------------------------------------------------
 
+fn encode_pack_uchar_spikes(op: &MetalSparse, enc: &ComputeEncoder, scratch: &Scratch) {
+    let n_spikes = op.shape.nrows;
+    let n_words = crate::spikes::packed_len(op.shape.ncols);
+    if n_words == 0 {
+        return;
+    }
+    let pipeline = &op.device.pack_uchar_spikes;
+    let tg = op.device.threadgroup_for(pipeline);
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &scratch.spikes.buffer);
+    set_buf(enc, 1, &scratch.x_spikes.buffer);
+    set_u32(enc, 2, n_spikes as u32);
+    set_u32(enc, 3, n_words as u32);
+    enc.dispatchThreads_threadsPerThreadgroup(size(n_words), size(tg));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hybrid_fused_side(
+    device: &MetalDevice,
+    enc: &ComputeEncoder,
+    side: &HybridSide,
+    x: &Buffer,
+    v: &Buffer,
+    theta: &Buffer,
+    spikes: &Buffer,
+    params: LifParams,
+) -> Result<(), OpError> {
+    if side.n_rows == 0 {
+        return Ok(());
+    }
+    let pipeline = &device.tier(side.kernel).fused_indexed;
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &side.row_ptr);
+    set_buf(enc, 1, &side.col);
+    set_buf(enc, 2, &side.values);
+    set_buf(enc, 3, x);
+    set_buf(enc, 4, v);
+    set_buf(enc, 5, theta);
+    set_buf(enc, 6, spikes);
+    set_buf(enc, 7, &side.row_ids);
+    set_f32(enc, 8, params.decay());
+    set_f32(enc, 9, params.v_reset());
+    set_f32(enc, 10, params.delta_theta());
+    set_u32(enc, 11, side.n_rows as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, side.n_rows);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hybrid_fused_spikes_side(
+    device: &MetalDevice,
+    enc: &ComputeEncoder,
+    side: &HybridSide,
+    x_spikes: &Buffer,
+    v: &Buffer,
+    theta: &Buffer,
+    spikes: &Buffer,
+    params: LifParams,
+) -> Result<(), OpError> {
+    if side.n_rows == 0 {
+        return Ok(());
+    }
+    let pipeline = &device.tier(side.kernel).fused_spikes_indexed;
+    enc.setComputePipelineState(pipeline);
+    set_buf(enc, 0, &side.row_ptr);
+    set_buf(enc, 1, &side.col);
+    set_buf(enc, 2, &side.values);
+    set_buf(enc, 3, x_spikes);
+    set_buf(enc, 4, v);
+    set_buf(enc, 5, theta);
+    set_buf(enc, 6, spikes);
+    set_buf(enc, 7, &side.row_ids);
+    set_f32(enc, 8, params.decay());
+    set_f32(enc, 9, params.v_reset());
+    set_f32(enc, 10, params.delta_theta());
+    set_u32(enc, 11, side.n_rows as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, side.n_rows);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_hybrid_spmm_side(
     device: &MetalDevice,
@@ -2415,26 +2816,29 @@ fn encode_hybrid_spmm_side(
     side: &HybridSide,
     x: &Buffer,
     y: &Buffer,
-    nrows: usize,
     n_vec: usize,
     max_tg: usize,
 ) -> Result<(), OpError> {
-    let pipeline = &device.tier(side.kernel).spmm;
+    if side.n_rows == 0 {
+        return Ok(());
+    }
+    let pipeline = &device.tier(side.kernel).spmm_indexed;
     enc.setComputePipelineState(pipeline);
     set_buf(enc, 0, &side.row_ptr);
     set_buf(enc, 1, &side.col);
     set_buf(enc, 2, &side.values);
     set_buf(enc, 3, x);
     set_buf(enc, 4, y);
-    set_u32(enc, 5, nrows as u32);
-    set_u32(enc, 6, n_vec as u32);
+    set_buf(enc, 5, &side.row_ids);
+    set_u32(enc, 6, side.n_rows as u32);
+    set_u32(enc, 7, n_vec as u32);
     match side.kernel {
         RowKernel::Scalar => {
-            let (grid, threads) = spmm_geometry(nrows, n_vec, max_tg);
+            let (grid, threads) = spmm_geometry(side.n_rows, n_vec, max_tg);
             enc.dispatchThreads_threadsPerThreadgroup(grid, threads);
         }
         RowKernel::Vec8 | RowKernel::Simd => {
-            dispatch_lines(enc, side.kernel, device, pipeline, nrows);
+            dispatch_lines(enc, side.kernel, device, pipeline, side.n_rows);
         }
     }
     Ok(())
@@ -2446,9 +2850,11 @@ fn encode_hybrid_spikes_side(
     side: &HybridSide,
     spikes: &Buffer,
     y: &Buffer,
-    nrows: usize,
 ) -> Result<(), OpError> {
-    let pipeline = &device.tier(side.kernel).spmv_spikes;
+    if side.n_rows == 0 {
+        return Ok(());
+    }
+    let pipeline = &device.tier(side.kernel).spmv_spikes_indexed;
     enc.setComputePipelineState(pipeline);
     set_buf(enc, 0, &side.row_ptr);
     set_buf(enc, 1, &side.col);
@@ -2457,52 +2863,35 @@ fn encode_hybrid_spikes_side(
     set_buf(enc, 2, &side.values);
     set_buf(enc, 3, spikes);
     set_buf(enc, 4, y);
-    set_u32(enc, 5, nrows as u32);
-    dispatch_lines(enc, side.kernel, device, pipeline, nrows);
+    set_buf(enc, 5, &side.row_ids);
+    set_u32(enc, 6, side.n_rows as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, side.n_rows);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_transpose_side(
     device: &MetalDevice,
     enc: &ComputeEncoder,
-    idx: &TransposeIndex,
-    kernel: RowKernel,
+    side: &HybridTransposeSide,
     values: &Buffer,
     x: &Buffer,
     y: &Buffer,
-    ncols: usize,
 ) -> Result<(), OpError> {
-    let pipeline = &device.tier(kernel).spmv_t;
+    if side.n_cols == 0 {
+        return Ok(());
+    }
+    let pipeline = &device.tier(side.kernel).spmv_t_indexed;
     enc.setComputePipelineState(pipeline);
-    set_buf(enc, 0, &idx.col_ptr);
-    set_buf(enc, 1, &idx.row);
-    set_buf(enc, 2, &idx.edge_idx);
+    set_buf(enc, 0, &side.col_ptr);
+    set_buf(enc, 1, &side.row);
+    set_buf(enc, 2, &side.edge_idx);
     set_buf(enc, 3, values);
     set_buf(enc, 4, x);
     set_buf(enc, 5, y);
-    set_u32(enc, 6, ncols as u32);
-    dispatch_lines(enc, kernel, device, pipeline, ncols);
+    set_buf(enc, 6, &side.col_ids);
+    set_u32(enc, 7, side.n_cols as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, side.n_cols);
     Ok(())
-}
-
-fn zero_f32_prefix(buffer: &Buffer, elems: usize) {
-    if elems == 0 {
-        return;
-    }
-    let bytes = elems
-        .checked_mul(std::mem::size_of::<f32>())
-        .expect("zero_f32_prefix length overflow");
-    assert!(
-        buffer.length() >= bytes,
-        "sparsl: scratch buffer holds {} bytes, tried to zero {bytes}",
-        buffer.length()
-    );
-    // SAFETY: shared buffer, length checked; zeroing resident scratch is not a
-    // caller-slice host copy (and must not trip the resident-path probe).
-    unsafe {
-        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0, bytes);
-    }
 }
 
 fn refresh_hybrid_side(
@@ -2510,15 +2899,10 @@ fn refresh_hybrid_side(
     weights: &[f32],
     precision: super::WeightPrecision,
 ) -> Result<(), OpError> {
-    let mut packed = Vec::with_capacity(side.src_edges.iter().map(|&(s, e)| e - s).sum());
-    for &(s, e) in &side.src_edges {
-        packed.extend_from_slice(&weights[s..e]);
-    }
-    write_from(&side.values, &packed);
-    if let (Some(buffer), Some(bits)) =
-        (side.values_narrow.as_ref(), precision.narrow_bits(&packed))
-    {
-        write_from(buffer, &bits);
+    let total_elems: usize = side.src_edges.iter().map(|&(s, e)| e - s).sum();
+    write_segments_from(&side.values, total_elems, &side.src_edges, weights);
+    if let Some(buffer) = side.values_narrow.as_ref() {
+        write_narrow_segments_from(buffer, total_elems, &side.src_edges, weights, precision);
     }
     Ok(())
 }
@@ -2530,13 +2914,15 @@ fn encode_hybrid_spmv_side(
     precision: super::WeightPrecision,
     x: &Buffer,
     y: &Buffer,
-    nrows: usize,
 ) -> Result<(), OpError> {
+    if side.n_rows == 0 {
+        return Ok(());
+    }
     let tier = device.tier(side.kernel);
     let (pipeline, values) = match (precision, side.values_narrow.as_ref()) {
-        (super::WeightPrecision::F16, Some(narrow)) => (&tier.spmv_f16, narrow),
-        (super::WeightPrecision::Bf16, Some(narrow)) => (&tier.spmv_bf16, narrow),
-        _ => (&tier.spmv, &side.values),
+        (super::WeightPrecision::F16, Some(narrow)) => (&tier.spmv_f16_indexed, narrow),
+        (super::WeightPrecision::Bf16, Some(narrow)) => (&tier.spmv_bf16_indexed, narrow),
+        _ => (&tier.spmv_indexed, &side.values),
     };
     enc.setComputePipelineState(pipeline);
     set_buf(enc, 0, &side.row_ptr);
@@ -2544,8 +2930,9 @@ fn encode_hybrid_spmv_side(
     set_buf(enc, 2, values);
     set_buf(enc, 3, x);
     set_buf(enc, 4, y);
-    set_u32(enc, 5, nrows as u32);
-    dispatch_lines(enc, side.kernel, device, pipeline, nrows);
+    set_buf(enc, 5, &side.row_ids);
+    set_u32(enc, 6, side.n_rows as u32);
+    dispatch_lines(enc, side.kernel, device, pipeline, side.n_rows);
     Ok(())
 }
 
@@ -2556,24 +2943,8 @@ fn encode_hybrid_spmv(
     x: &Buffer,
     y: &Buffer,
 ) -> Result<(), OpError> {
-    encode_hybrid_spmv_side(
-        &op.device,
-        enc,
-        &hybrid.long,
-        op.precision,
-        x,
-        y,
-        op.shape.nrows,
-    )?;
-    encode_hybrid_spmv_side(
-        &op.device,
-        enc,
-        &hybrid.short,
-        op.precision,
-        x,
-        y,
-        op.shape.nrows,
-    )?;
+    encode_hybrid_spmv_side(&op.device, enc, &hybrid.long, op.precision, x, y)?;
+    encode_hybrid_spmv_side(&op.device, enc, &hybrid.short, op.precision, x, y)?;
     Ok(())
 }
 
@@ -2830,6 +3201,10 @@ fn submit_and_wait(
     // the opaque driver selector to return.
     admit_submission(&METAL_ADMISSION, || cb.commit())
         .map_err(|reason| OpError::Backend { reason })?;
+    #[cfg(test)]
+    {
+        note_submission();
+    }
     let wait = wait_for_completion_with_timeout(
         &cb,
         operation,
@@ -2978,6 +3353,111 @@ fn read_buffer_into<T: Copy>(buffer: &Buffer, dst: &mut [T]) {
             dst.as_mut_ptr(),
             dst.len(),
         );
+    }
+}
+
+/// Stream disjoint `src[s..e]` slices sequentially into the head of a shared
+/// buffer with zero intermediate heap allocation (`set_weights` hybrid path).
+fn write_segments_from<T: Copy>(
+    buffer: &Buffer,
+    total_elems: usize,
+    segments: &[(usize, usize)],
+    src: &[T],
+) {
+    if total_elems == 0 {
+        return;
+    }
+    #[cfg(test)]
+    {
+        note_host_copy();
+    }
+    let bytes = total_elems
+        .checked_mul(std::mem::size_of::<T>())
+        .expect("write_segments_from byte size overflow");
+    assert!(
+        buffer.length() >= bytes,
+        "sparsl: buffer holds {} bytes, tried to write {bytes}",
+        buffer.length()
+    );
+    // SAFETY: shared buffer, total destination length checked above, `&mut self`
+    // exclusive access in `set_weights`, and every `(s, e)` comes from validated
+    // CSR row bounds within `src`.
+    unsafe {
+        let mut dst = buffer.contents().as_ptr() as *mut T;
+        for &(s, e) in segments {
+            let slice = &src[s..e];
+            let len = slice.len();
+            if len > 0 {
+                std::ptr::copy_nonoverlapping(slice.as_ptr(), dst, len);
+                dst = dst.add(len);
+            }
+        }
+    }
+}
+
+/// Stream narrowed `f16`/`bf16` weight segments directly into a shared `u16`
+/// buffer with zero intermediate heap allocation.
+fn write_narrow_segments_from(
+    buffer: &Buffer,
+    total_elems: usize,
+    segments: &[(usize, usize)],
+    weights: &[f32],
+    precision: super::WeightPrecision,
+) {
+    if total_elems == 0 {
+        return;
+    }
+    let encode: fn(f32) -> u16 = match precision {
+        super::WeightPrecision::F32 => return,
+        super::WeightPrecision::F16 => crate::half::f32_to_f16_bits,
+        super::WeightPrecision::Bf16 => crate::half::f32_to_bf16_bits,
+    };
+    #[cfg(test)]
+    {
+        note_host_copy();
+    }
+    let bytes = total_elems
+        .checked_mul(std::mem::size_of::<u16>())
+        .expect("write_narrow_segments_from byte size overflow");
+    assert!(
+        buffer.length() >= bytes,
+        "sparsl: narrow buffer holds {} bytes, tried to write {bytes}",
+        buffer.length()
+    );
+    // SAFETY: shared buffer, total destination length checked above, `&mut self`
+    // exclusive access in `set_weights`.
+    unsafe {
+        let mut dst = buffer.contents().as_ptr() as *mut u16;
+        for &(s, e) in segments {
+            for &w in &weights[s..e] {
+                dst.write(encode(w));
+                dst = dst.add(1);
+            }
+        }
+    }
+}
+
+/// Convert `u8` device spike flags directly from unified memory into `dst: &mut [bool]`
+/// without an intermediate `Vec<u8>` bounce buffer.
+fn read_u8_spikes_as_bool(buffer: &Buffer, dst: &mut [bool]) {
+    if dst.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    {
+        note_host_copy();
+    }
+    let len = dst.len();
+    assert!(
+        buffer.length() >= len,
+        "sparsl: spike buffer holds {} bytes, tried to read {len}",
+        buffer.length()
+    );
+    // SAFETY: `StorageModeShared` buffer is host-visible after `submit_and_wait`
+    // completed; `buffer.length() >= len` guarantees `0..len` is in bounds.
+    let src = unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr() as *const u8, len) };
+    for (out, &flag) in dst.iter_mut().zip(src.iter()) {
+        *out = flag != 0;
     }
 }
 
@@ -4652,5 +5132,357 @@ mod tests {
         let mut y = [0.0f32];
         op.spmv(&[1.0f32], &mut y).expect("spmv after timeout");
         assert_eq!(y[0], 1.0);
+    }
+
+    #[test]
+    fn lif_integrate_reuses_grown_scratch_across_varying_lengths() {
+        let Ok(dev) = shared() else {
+            return;
+        };
+        let params = LifParams::new(0.9, 0.0, 0.2).expect("valid LIF params");
+
+        let mut v256 = vec![0.4f32; 256];
+        let mut th256 = vec![1.0f32; 256];
+        let c256 = vec![0.7f32; 256];
+        let mut sp256 = vec![false; 256];
+        dev.lif_integrate(&mut v256, &mut th256, &c256, &mut sp256, params)
+            .expect("lif 256");
+        assert!(sp256[0]);
+        let (ptr_256, cap_256) = {
+            let guard = dev.lif_scratch.lock().expect("lif_scratch");
+            let s = guard.as_ref().expect("allocated");
+            (s.v.buffer.contents().as_ptr() as usize, s.n)
+        };
+        assert!(cap_256 >= 256);
+
+        // Smaller call must reuse the existing Metal buffer without shrinking,
+        // and still arm/verify logical-prefix sentinels at n = 64.
+        let mut v64 = vec![0.2f32; 64];
+        let mut th64 = vec![1.0f32; 64];
+        let c64 = vec![0.1f32; 64];
+        let mut sp64 = vec![true; 64];
+        dev.lif_integrate(&mut v64, &mut th64, &c64, &mut sp64, params)
+            .expect("lif 64");
+        assert!(!sp64[0]);
+        let (ptr_64, cap_64) = {
+            let guard = dev.lif_scratch.lock().expect("lif_scratch");
+            let s = guard.as_ref().expect("allocated");
+            (s.v.buffer.contents().as_ptr() as usize, s.n)
+        };
+        assert_eq!(ptr_64, ptr_256, "smaller LIF step must reuse Metal buffer");
+        assert_eq!(cap_64, cap_256);
+
+        // Larger call grows high-water mark cleanly.
+        let mut v512 = vec![0.5f32; 512];
+        let mut th512 = vec![1.0f32; 512];
+        let c512 = vec![0.6f32; 512];
+        let mut sp512 = vec![false; 512];
+        dev.lif_integrate(&mut v512, &mut th512, &c512, &mut sp512, params)
+            .expect("lif 512");
+        assert!(sp512[511]);
+        let cap_512 = dev
+            .lif_scratch
+            .lock()
+            .expect("lif_scratch")
+            .as_ref()
+            .expect("allocated")
+            .n;
+        assert!(cap_512 >= 512);
+    }
+
+    #[test]
+    fn hybrid_fused_dispatches_single_command_buffer_and_zero_host_copies() {
+        let Ok(metal) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let (csr, weights) = skewed_hub_csr(512, 192, 2);
+        let op = metal.prepare(&csr, csr.ncols(), &weights).expect("prepare");
+        assert!(
+            op.is_hybrid_forward(),
+            "skewed hub fixture must select hybrid forward"
+        );
+
+        let x: Vec<f32> = (0..csr.ncols()).map(|i| (i % 7) as f32 * 0.15).collect();
+        let v0 = vec![0.25f32; csr.nrows()];
+        let th0 = vec![1.0f32; csr.nrows()];
+        let params = crate::LifParams::new(0.95, 0.0, 0.05).expect("params");
+
+        op.write_x(&x).expect("write_x");
+        op.write_lif_state(&v0, &th0).expect("write_lif_state");
+
+        begin_host_copy_probe();
+        begin_submission_probe();
+        op.fused_spmv_lif_resident(params).expect("resident hybrid");
+        let submissions = end_submission_probe();
+        let copies = end_host_copy_probe();
+        assert_eq!(
+            submissions, 1,
+            "hybrid fused mega-kernel must submit 1 command buffer (not SpMV + LIF = 2)"
+        );
+        assert_eq!(
+            copies, 0,
+            "resident hybrid fused must perform 0 host copies"
+        );
+
+        let mut v_res = vec![0.0f32; csr.nrows()];
+        let mut th_res = vec![0.0f32; csr.nrows()];
+        let mut sp_res = vec![false; csr.nrows()];
+        op.sync_lif_state(&mut v_res, &mut th_res, &mut sp_res)
+            .expect("sync");
+
+        let mut v_slice = v0;
+        let mut th_slice = th0;
+        let mut sp_slice = vec![false; csr.nrows()];
+        op.fused_spmv_lif(&x, &mut v_slice, &mut th_slice, &mut sp_slice, params)
+            .expect("slice");
+        assert_eq!(v_res, v_slice);
+        assert_eq!(th_res, th_slice);
+        assert_eq!(sp_res, sp_slice);
+    }
+
+    #[test]
+    fn fused_spmv_spikes_lif_is_bit_identical_to_dense_fused_across_all_backends() {
+        let params = crate::LifParams::new(0.92, 0.0, 0.08).expect("params");
+        let fixtures = [
+            // Uniform fixture
+            {
+                let n = 130usize;
+                let mut adj = vec![Vec::new(); n];
+                for (r, row) in adj.iter_mut().enumerate() {
+                    for k in 0..12usize {
+                        row.push(((r * 7 + k * 11) % n) as u32);
+                    }
+                    row.sort_unstable();
+                    row.dedup();
+                }
+                let csr = Csr::from_adjacency(&adj);
+                let weights: Vec<f32> = (0..csr.nnz())
+                    .map(|i| ((i % 19) as f32 - 9.0) * 0.07)
+                    .collect();
+                (csr, weights)
+            },
+            // Skewed hybrid fixture (including empty rows via 0-degree modification)
+            {
+                let (csr_base, _) = skewed_hub_csr(260, 128, 2);
+                let mut adj = vec![Vec::new(); csr_base.nrows()];
+                for (r, row) in adj.iter_mut().enumerate() {
+                    if r % 17 == 5 && r >= 4 {
+                        // Empty rows exercise indexed hybrid partition handling of 0-nnz rows.
+                        continue;
+                    }
+                    let s = csr_base.row_ptr()[r] as usize;
+                    let e = csr_base.row_ptr()[r + 1] as usize;
+                    row.extend_from_slice(&csr_base.col()[s..e]);
+                }
+                let csr = Csr::from_adjacency(&adj);
+                let weights: Vec<f32> = (0..csr.nnz())
+                    .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+                    .collect();
+                (csr, weights)
+            },
+        ];
+
+        for (csr, weights) in &fixtures {
+            let n = csr.nrows();
+            let raw_spikes: Vec<bool> = (0..csr.ncols()).map(|i| (i * 13 + 3) % 7 < 2).collect();
+            let packed = crate::spikes::pack_spikes(&raw_spikes);
+            let dense = crate::spikes::spikes_to_f32(&packed, csr.ncols());
+            let v0: Vec<f32> = (0..n).map(|i| (i % 9) as f32 * 0.09).collect();
+            let th0 = vec![0.45f32; n];
+
+            let mut cpu_v_ref = None;
+            for backend in crate::available_backends() {
+                let dev = crate::Device::try_new(backend).expect("available backend");
+                let op = dev.prepare(csr, csr.ncols(), weights).expect("prepare");
+
+                let mut v_dense = v0.clone();
+                let mut th_dense = th0.clone();
+                let mut sp_dense = vec![false; n];
+                op.fused_spmv_lif(&dense, &mut v_dense, &mut th_dense, &mut sp_dense, params)
+                    .expect("dense fused");
+
+                let mut v_packed = v0.clone();
+                let mut th_packed = th0.clone();
+                let mut sp_packed = vec![false; n];
+                op.fused_spmv_spikes_lif(
+                    &packed,
+                    &mut v_packed,
+                    &mut th_packed,
+                    &mut sp_packed,
+                    params,
+                )
+                .expect("packed fused");
+
+                for i in 0..n {
+                    assert_eq!(
+                        v_packed[i].to_bits(),
+                        v_dense[i].to_bits(),
+                        "backend {} row {i}: packed v bits != dense v bits",
+                        backend.label()
+                    );
+                    assert_eq!(
+                        th_packed[i].to_bits(),
+                        th_dense[i].to_bits(),
+                        "backend {} row {i}: packed theta bits != dense theta bits",
+                        backend.label()
+                    );
+                }
+                assert_eq!(sp_packed, sp_dense);
+
+                if backend == crate::Backend::CpuSequential {
+                    cpu_v_ref = Some(v_packed.clone());
+                } else if let Some(ref v_cpu) = cpu_v_ref {
+                    let tol = crate::tolerance_for_spmv(op.shape().max_row_nnz(), 1.0, 2.0);
+                    for i in 0..n {
+                        if sp_packed[i] == (v_cpu[i] == params.v_reset()) {
+                            assert!(
+                                (v_packed[i] - v_cpu[i]).abs() <= tol,
+                                "backend {} row {i}: v={} cpu={} tol={tol}",
+                                backend.label(),
+                                v_packed[i],
+                                v_cpu[i]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recurrent_multi_step_mega_submission_runs_one_command_buffer_with_zero_host_copies() {
+        let Ok(metal) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let params = crate::LifParams::new(0.9, 0.0, 0.05).expect("params");
+
+        for skewed in [false, true] {
+            let (csr, weights) = if skewed {
+                skewed_hub_csr(256, 128, 3)
+            } else {
+                let n = 128usize;
+                let adj: Vec<Vec<u32>> = (0..n)
+                    .map(|r| {
+                        let mut v: Vec<u32> =
+                            (0..8).map(|k| ((r * 5 + k * 7) % n) as u32).collect();
+                        v.sort_unstable();
+                        v.dedup();
+                        v
+                    })
+                    .collect();
+                let c = Csr::from_adjacency(&adj);
+                let w: Vec<f32> = (0..c.nnz())
+                    .map(|i| ((i % 13) as f32 - 4.0) * 0.12)
+                    .collect();
+                (c, w)
+            };
+            let n = csr.nrows();
+            let op = metal.prepare(&csr, n, &weights).expect("prepare");
+            assert_eq!(op.is_hybrid_forward(), skewed);
+
+            let init_spikes: Vec<bool> = (0..n).map(|i| i % 5 == 0).collect();
+            let init_packed = crate::spikes::pack_spikes(&init_spikes);
+            let v0: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.1).collect();
+            let th0 = vec![0.4f32; n];
+
+            // Reference: step-by-step dense `fused_spmv_lif` on the same Metal operator.
+            let mut v_ref = v0.clone();
+            let mut th_ref = th0.clone();
+            let mut sp_ref = init_spikes.clone();
+            let steps = 16usize;
+            for _ in 0..steps {
+                let x_dense: Vec<f32> = sp_ref.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+                op.fused_spmv_lif(&x_dense, &mut v_ref, &mut th_ref, &mut sp_ref, params)
+                    .expect("ref step");
+            }
+
+            // Mega-submission: 16 recurrent ticks in 1 command buffer and 0 host copies.
+            op.write_x_spikes(&init_packed).expect("write_x_spikes");
+            op.write_lif_state(&v0, &th0).expect("write_lif_state");
+            begin_host_copy_probe();
+            begin_submission_probe();
+            op.fused_spmv_spikes_lif_recurrent_steps(params, steps)
+                .expect("recurrent mega-steps");
+            let submissions = end_submission_probe();
+            let copies = end_host_copy_probe();
+            assert_eq!(
+                submissions, 1,
+                "skewed={skewed}: 16 recurrent ticks must submit 1 command buffer"
+            );
+            assert_eq!(
+                copies, 0,
+                "skewed={skewed}: recurrent mega-submission must perform 0 host copies"
+            );
+
+            let mut v_got = vec![0.0f32; n];
+            let mut th_got = vec![0.0f32; n];
+            let mut sp_got = vec![false; n];
+            op.sync_lif_state(&mut v_got, &mut th_got, &mut sp_got)
+                .expect("sync");
+            assert_eq!(v_got, v_ref, "skewed={skewed}: recurrent v mismatch");
+            assert_eq!(th_got, th_ref, "skewed={skewed}: recurrent theta mismatch");
+            assert_eq!(sp_got, sp_ref, "skewed={skewed}: recurrent spikes mismatch");
+
+            // Chunk boundary > 256 steps splits cleanly into 2 bounded command buffers.
+            op.write_x_spikes(&init_packed).expect("write_x_spikes");
+            op.write_lif_state(&v0, &th0).expect("write_lif_state");
+            begin_submission_probe();
+            op.fused_spmv_spikes_lif_recurrent_steps(params, 300)
+                .expect("300 steps");
+            assert_eq!(end_submission_probe(), 2);
+        }
+
+        // Rectangular operator refuses recurrent spike packing closed and loud.
+        let rect_csr = Csr::from_adjacency(&[vec![0, 1], vec![2]]);
+        let rect_op = metal
+            .prepare(&rect_csr, rect_csr.ncols(), &[1.0, 1.0, 1.0])
+            .expect("rect");
+        assert!(matches!(
+            rect_op.pack_resident_spikes_to_x_spikes(),
+            Err(OpError::Length { .. })
+        ));
+        assert!(matches!(
+            rect_op.fused_spmv_spikes_lif_recurrent_steps(params, 2),
+            Err(OpError::Length { .. })
+        ));
+    }
+
+    #[test]
+    fn hybrid_set_weights_refreshes_compact_sides_for_all_precisions() {
+        let Ok(metal) = crate::Device::try_new(crate::Backend::Metal) else {
+            return;
+        };
+        let (csr, w_init) = skewed_hub_csr(256, 128, 2);
+        let w_new: Vec<f32> = w_init
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| -w + (i % 5) as f32 * 0.1)
+            .collect();
+        let x: Vec<f32> = (0..csr.ncols()).map(|i| (i % 7) as f32 * 0.25).collect();
+
+        for precision in [
+            crate::WeightPrecision::F32,
+            crate::WeightPrecision::F16,
+            crate::WeightPrecision::Bf16,
+        ] {
+            let mut op_mutated = metal
+                .prepare_with(&csr, csr.ncols(), &w_init, precision)
+                .expect("prepare init");
+            assert!(op_mutated.is_hybrid_forward());
+            op_mutated.set_weights(&w_new).expect("set_weights");
+
+            let op_fresh = metal
+                .prepare_with(&csr, csr.ncols(), &w_new, precision)
+                .expect("prepare fresh");
+
+            let mut y_mut = vec![0.0f32; csr.nrows()];
+            let mut y_fresh = vec![0.0f32; csr.nrows()];
+            op_mutated.spmv(&x, &mut y_mut).expect("spmv mutated");
+            op_fresh.spmv(&x, &mut y_fresh).expect("spmv fresh");
+            assert_eq!(
+                y_mut, y_fresh,
+                "hybrid set_weights must match fresh prepare bit-for-bit at {precision:?}"
+            );
+        }
     }
 }
