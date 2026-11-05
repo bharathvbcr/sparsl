@@ -6,6 +6,17 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The `msrv` job installs the `rust-version` Cargo.toml declares instead of a version written into
+  the workflow** (`.github/workflows/ci.yml`). `rust-version = "1.82"` is correct and stays: sparsl's
+  graph is `rand`, `rand_chacha`, `rayon` and the optional `objc2` Metal stack — nothing from ojas or
+  tessl — and the floor was measured on 2026-11-01 with `cargo +1.82 check --locked --all-targets`,
+  with and without `--features metal`, both clean. What changed is that the number now lives in one
+  place. It was spelled `1.82.0` in the job and `1.82` in the job name, which is exactly how the
+  sibling tessl repository came to run a job called "MSRV 1.82" against a crate that could no longer
+  build below 1.97: a path dependency raised its real floor and nothing compared the two spellings.
+
 ## [0.3.0] — 2026-09-18
 
 Breaking CSR shape honesty: stored column count, sorted rows, and overflow-safe

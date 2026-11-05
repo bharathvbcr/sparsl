@@ -153,8 +153,20 @@ jobs:
           cargo run --locked --release --features metal --example batch_crossover
 
   # ---------------------------------------------------------------------------
-  # Cargo.toml claims `rust-version = "1.82"`. Unverified, that is just a string
-  # in a manifest, so this builds against exactly that toolchain.
+  # Unverified, `rust-version` is just a string in a manifest, so this builds
+  # against exactly the toolchain Cargo.toml declares.
+  #
+  # The version is READ OUT of Cargo.toml rather than written here. It used to
+  # be spelled 1.82.0 in this job and 1.82 in the job name, which is how the
+  # sibling tessl repository ended up installing 1.82 for a crate that could no
+  # longer build below 1.97: a path dependency raised its real floor and nothing
+  # failed, because the number lived in two places that nobody compared. sparsl
+  # has no such dependency — its graph is rand, rand_chacha, rayon and the
+  # optional objc2 Metal stack, nothing from ojas or tessl — and 1.82 was
+  # measured to be true for it on 2026-11-01 (`cargo +1.82 check --locked
+  # --all-targets`, with and without `--features metal`, both clean). This
+  # change is the guard, not a correction: whatever the manifest says next, the
+  # job installs that.
   #
   # Two deliberate flags, both load-bearing:
   #
@@ -165,12 +177,20 @@ jobs:
   # old gate, the compile checks include every target and dev-dependency.
   # ---------------------------------------------------------------------------
   msrv:
-    name: MSRV 1.82 / locked graph + all targets
+    name: MSRV (the rust-version Cargo.toml declares) / locked graph + all targets
     if: ${{ github.event_name != 'schedule' }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.82.0
+      - name: Rust toolchain at the declared rust-version
+        # `test -n` so a renamed or reformatted field fails here instead of
+        # quietly installing whatever `rustup default ""` would pick.
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\([0-9.]*\)"/\1/p' Cargo.toml)
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+          rustc --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo metadata --locked --format-version 1 > /dev/null
       - run: cargo check --locked --all-targets
