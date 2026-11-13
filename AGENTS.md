@@ -62,6 +62,13 @@ It provides deterministic sparse matrix representations (CSR, CSC), sparse linea
   caller code that was itself safe. Reachability is the enforcement — `SparseOp` is the only route
   to a sparse kernel — so making that module public again would reopen the hole.
 
+## Toolchain floor
+
+`rust-version = "1.100"` in `Cargo.toml` is the single source of the floor; the CI `msrv` job reads it
+from there. It was 1.82 (measured 2026-11-01) until the owner raised it on 2026-11-12, so any older note
+that says 1.82 is history. `.cargo/config.toml` sets a 3-day dependency cooldown for resolution. `f16`
+is still unstable on 1.100, so `src/half.rs` keeps binary16 as raw `u16` bits.
+
 ## Testing & Verification
 
 ```sh

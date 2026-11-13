@@ -2,7 +2,7 @@
 name = "sparsl"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.100"
 description = "Deterministic sparse + scan compute kernels for event-driven simulation, serving as the dedicated Sparse Computing extension of ojas"
 repository = "https://github.com/bharathvbcr/sparsl"
 documentation = "https://docs.rs/sparsl"
@@ -86,6 +86,8 @@ objc2-metal = { version = "0.3", optional = true, features = [
 # an edition-2024 manifest that Cargo 1.82 cannot even parse during metadata
 # resolution. The in-process differential suite needs none of those newer APIs,
 # fork, or timeout support, so pin the newest rand-0.8 line and keep only `std`.
+# (The 1.82 floor that forced this pin was raised to 1.100 on 2026-11-12, so the
+# parse constraint is gone; the pin stays until an owner-approved dev-dependency bump.)
 proptest = { version = "=1.6.0", default-features = false, features = ["std"] }
 
 [[example]]

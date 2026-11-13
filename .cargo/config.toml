@@ -1,0 +1,4 @@
+# Dependency cooldown (Cargo 1.100+): resolution skips crate versions published
+# less than 3 days ago, giving yanks time to land. `--locked` builds are unaffected.
+[registry]
+global-min-publish-age = "3 days"

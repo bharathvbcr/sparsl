@@ -88,8 +88,8 @@ pub struct State {
 // backend's zero-reformat/direct typed byte-copy upload is sound only if this
 // holds. Keep this anonymous:
 // a named private const linked from public docs fails rustdoc's
-// `private_intra_doc_links` lint, while a named-but-unused const warns on the
-// crate's Rust 1.82 MSRV.
+// `private_intra_doc_links` lint, while a named-but-unused const warns as
+// dead code.
 const _: () = {
     assert!(core::mem::size_of::<State>() == 2 * core::mem::size_of::<f32>());
     assert!(core::mem::align_of::<State>() == core::mem::align_of::<f32>());

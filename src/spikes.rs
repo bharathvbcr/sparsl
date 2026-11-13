@@ -46,8 +46,7 @@ pub const fn packed_len(n: usize) -> usize {
 /// Pack a boolean spike vector, least-significant bit first.
 pub fn pack_spikes(spikes: &[bool]) -> Vec<u32> {
     let mut out = Vec::with_capacity(packed_len(spikes.len()));
-    let chunks = spikes.chunks_exact(SPIKES_PER_WORD);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = spikes.as_chunks::<SPIKES_PER_WORD>();
     for chunk in chunks {
         let mut word = 0u32;
         for (bit, &fired) in chunk.iter().enumerate() {
@@ -78,8 +77,7 @@ pub fn pack_spikes_into(spikes: &[bool], out: &mut [u32]) {
         out.len(),
         spikes.len()
     );
-    let chunks = spikes.chunks_exact(SPIKES_PER_WORD);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = spikes.as_chunks::<SPIKES_PER_WORD>();
     let full = chunks.len();
     for (dst, chunk) in out[..full].iter_mut().zip(chunks) {
         let mut word = 0u32;
@@ -113,10 +111,8 @@ pub fn unpack_spikes(words: &[u32], n: usize) -> Vec<bool> {
     );
     let mut out = vec![false; n];
     let full_words = n / SPIKES_PER_WORD;
-    for (chunk, &word) in out[..full_words * SPIKES_PER_WORD]
-        .chunks_exact_mut(SPIKES_PER_WORD)
-        .zip(&words[..full_words])
-    {
+    let (full_chunks, _) = out[..full_words * SPIKES_PER_WORD].as_chunks_mut::<SPIKES_PER_WORD>();
+    for (chunk, &word) in full_chunks.iter_mut().zip(&words[..full_words]) {
         for (bit, dst) in chunk.iter_mut().enumerate() {
             *dst = ((word >> bit) & 1) == 1;
         }

@@ -156,6 +156,9 @@ jobs:
   # Unverified, `rust-version` is just a string in a manifest, so this builds
   # against exactly the toolchain Cargo.toml declares.
   #
+  # Update 2026-11-12: the owner raised the floor from 1.82 to 1.100, so this job
+  # now installs 1.100 with no edit here; the 1.82 measurements below are history.
+  #
   # The version is READ OUT of Cargo.toml rather than written here. It used to
   # be spelled 1.82.0 in this job and 1.82 in the job name, which is how the
   # sibling tessl repository ended up installing 1.82 for a crate that could no

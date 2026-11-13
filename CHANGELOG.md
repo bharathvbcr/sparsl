@@ -8,6 +8,16 @@ All notable changes to `sparsl` are recorded here. The format follows
 
 ### Changed
 
+- **`rust-version` raised from 1.82 to 1.100 (owner decision, 2026-11-12), overriding the 1.82 floor
+  policy recorded below.** The floor was a deliberate choice measured on 2026-11-01; it is now
+  superseded, not wrong for the releases that carried it. The `msrv` CI job reads the number from
+  `Cargo.toml`, so it now installs 1.100 with no workflow edit. Reviewed for code that existed only
+  to satisfy 1.82: `crate::half` still carries binary16 as raw `u16` because `f16` is unstable on
+  rustc 1.100.0 too (E0658, checked), so nothing was simplified. The `proptest = "=1.6.0"` pin was
+  set to keep Cargo 1.82 able to parse the lockfile graph; that constraint no longer applies, but
+  lifting the pin is a dependency bump and is left for a separate decision. Added `.cargo/config.toml`
+  with `registry.global-min-publish-age = "3 days"` (dependency cooldown; resolution only).
+
 - **The `msrv` job installs the `rust-version` Cargo.toml declares instead of a version written into
   the workflow** (`.github/workflows/ci.yml`). `rust-version = "1.82"` is correct and stays: sparsl's
   graph is `rand`, `rand_chacha`, `rayon` and the optional `objc2` Metal stack — nothing from ojas or

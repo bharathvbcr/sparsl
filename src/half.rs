@@ -8,7 +8,7 @@
 //! matters: round-to-nearest sends the top roughly 0.2% of f32's positive
 //! finite range, including [`f32::MAX`], to infinity.
 //!
-//! Rust's `f16` is still unstable, and this crate's MSRV is 1.82, so the type
+//! Rust's `f16` is still unstable (verified on rustc 1.100.0: E0658), so the type
 //! is carried as its bit pattern and converted explicitly. That is not purely a
 //! workaround: every conversion site being visible is what makes the error
 //! analysis in [`crate::tolerance_for_spmv_f16`] auditable.

@@ -58,7 +58,7 @@ impl SampleStats {
         let mut sorted = samples.to_vec();
         sorted.sort_by(f64::total_cmp);
         let middle = sorted.len() / 2;
-        let median = if sorted.len() % 2 == 0 {
+        let median = if sorted.len().is_multiple_of(2) {
             let lower = sorted[middle - 1];
             lower + (sorted[middle] - lower) / 2.0
         } else {
@@ -274,7 +274,7 @@ pub fn time_zeroed_output<E>(
 /// Forward arm order on even rounds, reverse order on odd rounds.
 #[allow(dead_code)] // This shared module is compiled separately by scan/batch examples.
 pub fn balanced_arm_order(round: usize, arm_count: usize) -> impl Iterator<Item = usize> {
-    let forward = round % 2 == 0;
+    let forward = round.is_multiple_of(2);
     (0..arm_count).map(move |offset| {
         if forward {
             offset
@@ -403,7 +403,7 @@ fn validate_samples(samples: &[f64]) -> Result<(), String> {
 }
 
 fn require_even_sample_rounds(sample_rounds: usize) -> Result<(), String> {
-    if sample_rounds % 2 == 0 {
+    if sample_rounds.is_multiple_of(2) {
         Ok(())
     } else {
         Err(format!(
